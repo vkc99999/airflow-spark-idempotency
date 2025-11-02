@@ -1,0 +1,55 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-spark-role
+  namespace: airflow
+rules:
+- apiGroups: [""]
+  resources:
+    - pods
+    - pods/log
+    - pods/exec
+    - services
+    - configmaps
+    - secrets
+  verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+    - deletecollection
+- apiGroups: ["batch"]
+  resources:
+    - jobs
+  verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+    - deletecollection
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-spark-binding
+  namespace: airflow
+subjects:
+- kind: ServiceAccount
+  name: airflow-sa
+  namespace: airflow
+- kind: ServiceAccount
+  name: airflow-worker
+  namespace: airflow
+- kind: ServiceAccount
+  name: airflow-scheduler
+  namespace: airflow
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: airflow-spark-role

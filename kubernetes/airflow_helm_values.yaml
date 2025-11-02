@@ -1,0 +1,130 @@
+executor: KubernetesExecutor
+
+postgresql:
+  enabled: false   # Using external Postgres
+
+data:
+  metadataConnection:
+    protocol: postgresql
+    host: host.minikube.internal
+    port: 5432
+    db: airflow
+    user: airflow
+    pass: yourpassword
+
+logs:
+  persistence:
+    enabled: false
+
+images:
+  airflow:
+    repository: my-airflow
+    tag: "3.0.0-spark-v23"
+    pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: airflow-sa
+
+airflow:
+  defaultUser:
+    enabled: true
+    username: krishna
+    password: admin
+
+# === DAGs & Plugins mounts ===
+# Run these on your host before Helm upgrade:
+#   minikube mount $(pwd)/dags:/airflow-dags
+#   minikube mount $(pwd)/plugins:/airflow-plugins
+dags:
+  persistence: { enabled: false }
+  gitSync:     { enabled: false }
+
+scheduler:
+  extraVolumes:
+    - name: dags
+      hostPath: { path: /airflow-dags }
+    - name: plugins
+      hostPath: { path: /airflow-plugins }
+  extraVolumeMounts:
+    - { name: dags, mountPath: /opt/airflow/dags }
+    - { name: plugins, mountPath: /opt/airflow/plugins }
+  env:
+    - { name: AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL, value: "5" }
+    - { name: PGHOST, value: host.minikube.internal }
+    - { name: PGPORT, value: "5432" }
+    - { name: PGDATABASE, value: airflow }
+    - { name: PGUSER, value: airflow }
+    - { name: PGPASSWORD, value: yourpassword }
+
+dagProcessor:
+  extraVolumes:
+    - name: dags
+      hostPath: { path: /airflow-dags }
+    - name: plugins
+      hostPath: { path: /airflow-plugins }
+  extraVolumeMounts:
+    - { name: dags, mountPath: /opt/airflow/dags }
+    - { name: plugins, mountPath: /opt/airflow/plugins }
+
+web:
+  extraVolumes:
+    - name: dags
+      hostPath: { path: /airflow-dags }
+    - name: plugins
+      hostPath: { path: /airflow-plugins }
+  extraVolumeMounts:
+    - { name: dags, mountPath: /opt/airflow/dags }
+    - { name: plugins, mountPath: /opt/airflow/plugins }
+  service:
+    type: NodePort
+    ports:
+      - { name: http, port: 8080, targetPort: 8080, nodePort: 30080 }
+
+triggerer:
+  extraVolumes:
+    - name: dags
+      hostPath: { path: /airflow-dags }
+    - name: plugins
+      hostPath: { path: /airflow-plugins }
+  extraVolumeMounts:
+    - { name: dags, mountPath: /opt/airflow/dags }
+    - { name: plugins, mountPath: /opt/airflow/plugins }
+
+config:
+  core:
+    load_examples: "false"
+    fernet_key: "eu47Ga3PCdZnYvYQJ3sfUTFyCmcx1nQZ47XUUyA8_k0="
+  api:
+    auth_backend: airflow.api.auth.backend.basic_auth
+  webserver:
+    base_url: http://localhost:8080
+    secret_key: "1741097a26448326d45cbade63f3e82789834bcaf49281ec33b1a1d2ff82f1e1"
+  kubernetes_executor:
+    delete_worker_pods: "False"
+
+logging:
+  remote_logging: "False"
+  colored_console_log: "True"
+  remote_base_log_folder: ""
+
+env:
+  # Spark connection for DAGs
+  - name: AIRFLOW_CONN_SPARK_K8S
+    value: |-
+      {"conn_type": "spark",
+       "host": "k8s://https://kubernetes.default.svc",
+       "extra": {
+         "deploy-mode": "cluster",
+         "namespace": "airflow",
+         "spark-binary": "spark-submit"
+       }}
+  # Postgres credentials for XCom access
+  - { name: PGHOST, value: host.minikube.internal }
+  - { name: PGPORT, value: "5432" }
+  - { name: PGDATABASE, value: airflow }
+  - { name: PGUSER, value: airflow }
+  - { name: PGPASSWORD, value: yourpassword }
+
+statsd:
+  enabled: false

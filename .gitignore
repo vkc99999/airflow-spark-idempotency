@@ -1,0 +1,20 @@
+# Python / Airflow
+__pycache__/
+*.pyc
+.venv/
+logs/
+airflow_home/
+airflow_logs/
+.env
+.env.*
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Helm / Docker / Build
+*.log
+dist/
+build/
+*.tgz

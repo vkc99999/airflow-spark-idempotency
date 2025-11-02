@@ -1,0 +1,12 @@
+
+# Base Spark official image with Java included
+FROM apache/spark:3.5.7
+
+# Set working dir for Spark job
+WORKDIR /opt/spark/work-dir
+
+# Copy your PySpark job into the image
+COPY scripts/pi.py .
+
+# Default command (not strictly needed for Airflow)
+CMD ["bash"]

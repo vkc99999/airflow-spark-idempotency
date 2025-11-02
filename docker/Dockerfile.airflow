@@ -1,0 +1,50 @@
+FROM apache/airflow:3.0.0-python3.10
+
+USER root
+
+# --- Versions (adjust if needed) ---
+ARG JDK_URL="https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.28+6/OpenJDK11U-jdk_x64_linux_hotspot_11.0.28_6.tar.gz"
+ARG SPARK_URL="https://archive.apache.org/dist/spark/spark-3.5.7/spark-3.5.7-bin-hadoop3.tgz"
+
+# Tools (curl, tar, gzip, certs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates tar gzip procps && \
+    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client && rm -rf /var/lib/apt/lists/*
+
+# kubectl (for Spark K8s operator idempotency check)
+RUN curl -Ls "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+  -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+
+# Install JDK 11 (Temurin)
+RUN mkdir -p /opt/java && \
+    curl -L "$JDK_URL" -o /tmp/jdk.tgz && \
+    tar -xzf /tmp/jdk.tgz -C /opt/java --strip-components=1 && \
+    rm /tmp/jdk.tgz && \
+    ln -s /opt/java/bin/java /usr/bin/java
+
+# Install Spark 3.5.7
+RUN mkdir -p /opt && \
+    curl -L "$SPARK_URL" -o /tmp/spark.tgz && \
+    tar -xzf /tmp/spark.tgz -C /opt && \
+    rm /tmp/spark.tgz && \
+    ln -s /opt/spark-3.5.7-bin-hadoop3 /opt/spark
+
+# Environment setup (Java + Spark)
+ENV JAVA_HOME=/opt/java \
+    SPARK_HOME=/opt/spark \
+    PATH=$SPARK_HOME/bin:$JAVA_HOME/bin:$PATH
+
+USER airflow
+
+# ---------------------------
+# FORCE COPY requirements, dags, plugins
+# ---------------------------
+
+# Always copy requirements and re-run install
+COPY docker/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Always copy dags and plugins last (forces new layer if they change)
+COPY dags/ /opt/airflow/dags/
+COPY plugins/ /opt/airflow/plugins/

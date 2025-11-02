@@ -1,0 +1,22 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: spark-pi-demo
+  namespace: airflow
+spec:
+  type: Python
+  mode: cluster
+  image: spark-job:latest
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/spark/work-dir/pi.py
+  sparkVersion: "3.5.7"
+  sparkConf:
+    "spark.kubernetes.namespace": "airflow"
+  driver:
+    cores: 1
+    memory: 512m
+    serviceAccount: airflow-sa
+  executor:
+    cores: 1
+    memory: 512m
+    instances: 2
