@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import List
+
+import boto3
+from airflow import DAG
+from airflow.exceptions import AirflowFailException
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
+from airflow.providers.amazon.aws.sensors.emr import EmrStepSensor
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.decorators import task
+import pendulum
+
+# -----------------------
+# Config (template-style)
+# -----------------------
+CFG = {
+    "dag_id": "lakehouse_in_clinical_source_load_{{ SOURCE_DATASET }}",
+    "tags": [{{ DAG_TAGS }}],
+    "emr_name": "{{ EMR_CONFIG_NAME }}",
+    "schedule": {{ SCHEDULE }},
+    "max_active_runs": 1,
+    "sensor_poke_interval": 4 * 60 * 60,
+    "sensor_timeout": 24 * 60 * 60,
+
+    "sdlc_env": Variable.get("SDLC_ENV"),
+    "ods_bucket": Variable.get("ODS_S3_BUCKET"),
+
+    "source_system": "{{ SOURCE_SYSTEM }}",
+    "source_dataset": "{{ SOURCE_DATASET }}",
+
+    # landing/<system>/source/current/
+    "source_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/current",
+    # landing/<system>/source/<dataset>/
+    "target_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/{{ SOURCE_DATASET }}",
+
+    # EMR scripts (keep same as your reference)
+    "script_landing_to_raw": "/home/hadoop/ods-utilities/landingToRawS3.sh",
+    "script_raw_to_sss": "/home/hadoop/batch-process/ods-raw-delta-process.sh",
+
+    # If your reference uses raw_table/raw_schema, keep them templated
+    "raw_table": "{{ RAW_TABLE }}",
+    "raw_schema": "{{ RAW_SCHEMA }}",
+
+    "aws_conn_id": "aws_default",
+    "emr_config_key": "admin/config/BMC_EMR.config",
+}
+
+ODS_BUCKET = CFG["ods_bucket"]
+
+
+# -----------------------
+# Helper functions
+# -----------------------
+def _get_emr_id() -> str:
+    s3 = boto3.resource("s3")
+    body = (
+        s3.Object(ODS_BUCKET, CFG["emr_config_key"])
+        .get()["Body"]
+        .read()
+        .decode("utf-8")
+    )
+
+    matches = []
+    for line in body.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) > 3 and parts[0] == CFG["emr_name"].strip():
+            matches.append(parts[3])
+
+    if not matches:
+        raise AirflowFailException(
+            f"EMR cluster '{CFG['emr_name']}' not found in s3://{ODS_BUCKET}/{CFG['emr_config_key']}"
+        )
+    return matches[0].strip()
+
+
+EMR_CLUSTER_ID = _get_emr_id()
+
+
+def make_emr_step(name: str, script: str, args: List[str]) -> dict:
+    return {
+        "Name": name,
+        "ActionOnFailure": "CONTINUE",
+        "HadoopJarStep": {
+            "Jar": "command-runner.jar",
+            "Args": ["bash", script] + args,
+        },
+    }
+
+
+def args_landing_to_raw() -> List[str]:
+    # Match your reference pattern; adjust only if reference differs
+    # e.g. [bucket, source_system, raw_table, "incremental", raw_schema]
+    return [
+        CFG["ods_bucket"],
+        CFG["source_system"],
+        CFG["raw_table"],
+        "incremental",          # framework doesn’t distinguish; full handled by manual step
+        CFG["raw_schema"],
+    ]
+
+
+def args_raw_to_sss() -> List[str]:
+    # Keep same style as reference. If reference uses ctrl file path, build/push it similarly.
+    # For now, placeholder minimal args — replace with your exact reference args.
+    return [
+        CFG["ods_bucket"],
+        CFG["source_system"],
+        CFG["raw_table"],
+    ]
+
+
+def _branch_on_file_type(**kwargs) -> str:
+    ti = kwargs["ti"]
+    sensor_task_id = f"FILE_WATCHER.s3_file_sensor_task"
+    s3_key = ti.xcom_pull(task_ids=sensor_task_id)
+    if not s3_key:
+        raise AirflowFailException("No file found by sensor.")
+
+    fn = s3_key.split("/")[-1]
+    if "-Full-" in fn:
+        return "manual_intervention_full"
+    return "skip_manual_intervention"
+
+
+def _manual_intervention_full() -> None:
+    # Intentionally FAIL.
+    # You clean up table manually, then Mark Success in UI to continue.
+    raise AirflowFailException(
+        "FULL load detected. Clean up target table manually, then Mark this task SUCCESS to proceed."
+    )
+
+
+def _move_s3_files(**kwargs) -> List[str]:
+    """
+    Move .tsv files from source/current/ to source/<dataset>/ and delete from current/.
+    Stores moved keys in XCom: processed_files_list
+    """
+    ti = kwargs["ti"]
+    s3 = S3Hook(aws_conn_id=CFG["aws_conn_id"])
+
+    src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
+    tgt_prefix = CFG["target_s3_path"].rstrip("/") + "/"
+
+    keys = s3.list_keys(bucket_name=ODS_BUCKET, prefix=src_prefix) or []
+    to_move = [k for k in keys if k.endswith(".tsv")]
+
+    if not to_move:
+        raise AirflowFailException(f"No .tsv files found under s3://{ODS_BUCKET}/{src_prefix}")
+
+    moved = []
+    for k in to_move:
+        new_key = k.replace(src_prefix, tgt_prefix, 1)
+        s3.copy_object(
+            source_bucket_key=k,
+            dest_bucket_key=new_key,
+            source_bucket_name=ODS_BUCKET,
+            dest_bucket_name=ODS_BUCKET,
+        )
+        s3.delete_objects(bucket=ODS_BUCKET, keys=[k])
+        moved.append(new_key)
+
+    ti.xcom_push(key="processed_files_list", value=moved)
+    return moved
+
+
+def _cleanup_target_files(**kwargs) -> None:
+    """
+    After all EMR steps succeed, delete the moved files from landing/<system>/source/<dataset>/
+    """
+    ti = kwargs["ti"]
+    s3 = S3Hook(aws_conn_id=CFG["aws_conn_id"])
+    moved = ti.xcom_pull(task_ids="move_files_from_source_to_target", key="processed_files_list") or []
+    if not moved:
+        return
+    s3.delete_objects(bucket=ODS_BUCKET, keys=moved)
+
+
+# -----------------------
+# DAG
+# -----------------------
+default_args = {
+    "owner": "data-eng",
+    "retries": 0,  # important: manual intervention should not keep retrying
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id=CFG["dag_id"],
+    default_args=default_args,
+    description="Landing -> Target staging -> EMR steps -> Cleanup",
+    schedule=CFG["schedule"],
+    start_date=pendulum.datetime(2025, 12, 1, tz="America/New_York"),
+    catchup=False,
+    tags=CFG["tags"],
+    max_active_runs=CFG["max_active_runs"],
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+
+    # 1) File watcher (returns one key)
+    with TaskGroup(group_id="FILE_WATCHER") as file_watcher_group:
+
+        @task.sensor(
+            task_id="s3_file_sensor_task",
+            mode="reschedule",
+            poke_interval=CFG["sensor_poke_interval"],
+            timeout=CFG["sensor_timeout"],
+        )
+        def s3_file_sensor():
+            s3 = S3Hook(aws_conn_id=CFG["aws_conn_id"])
+            src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
+            keys = s3.list_keys(bucket_name=ODS_BUCKET, prefix=src_prefix) or []
+            for k in keys:
+                if k.endswith(".tsv"):
+                    return k
+            return False
+
+        s3_file_sensor()
+
+    # 2) Move current -> dataset folder (always)
+    move_files_from_source_to_target = PythonOperator(
+        task_id="move_files_from_source_to_target",
+        python_callable=_move_s3_files,
+    )
+
+    # 3) Full vs Incremental gate (full = manual intervention)
+    branch = BranchPythonOperator(
+        task_id="branch_on_load_type",
+        python_callable=_branch_on_file_type,
+    )
+
+    manual_intervention_full = PythonOperator(
+        task_id="manual_intervention_full",
+        python_callable=_manual_intervention_full,
+    )
+
+    skip_manual_intervention = EmptyOperator(task_id="skip_manual_intervention")
+
+    gate_done = EmptyOperator(
+        task_id="gate_done",
+        trigger_rule=TriggerRule.ONE_SUCCESS,  # manual marked success OR incremental skip
+    )
+
+    # 4) EMR: Landing -> Raw (TaskGroup with add+wait)
+    with TaskGroup(group_id="landing_to_raw") as tg_l2r:
+
+        add = EmrAddStepsOperator(
+            task_id="add",
+            job_flow_id=EMR_CLUSTER_ID,
+            aws_conn_id=CFG["aws_conn_id"],
+            steps=[
+                make_emr_step(
+                    name=f"Landing->Raw {CFG['source_system']}/{CFG['source_dataset']}",
+                    script=CFG["script_landing_to_raw"],
+                    args=args_landing_to_raw(),
+                )
+            ],
+        )
+
+        wait = EmrStepSensor(
+            task_id="wait",
+            job_flow_id=EMR_CLUSTER_ID,
+            aws_conn_id=CFG["aws_conn_id"],
+            step_id="{{ ti.xcom_pull(task_ids='landing_to_raw.add', key='return_value')[0] }}",
+            poke_interval=60,
+            timeout=3600,
+        )
+
+        add >> wait
+
+    # 5) EMR: Raw -> SSS (TaskGroup with add+wait)
+    with TaskGroup(group_id="raw_to_sss") as tg_r2s:
+
+        add = EmrAddStepsOperator(
+            task_id="add",
+            job_flow_id=EMR_CLUSTER_ID,
+            aws_conn_id=CFG["aws_conn_id"],
+            steps=[
+                make_emr_step(
+                    name=f"Raw->SSS {CFG['source_system']}/{CFG['source_dataset']}",
+                    script=CFG["script_raw_to_sss"],
+                    args=args_raw_to_sss(),  # replace with your exact reference args
+                )
+            ],
+        )
+
+        wait = EmrStepSensor(
+            task_id="wait",
+            job_flow_id=EMR_CLUSTER_ID,
+            aws_conn_id=CFG["aws_conn_id"],
+            step_id="{{ ti.xcom_pull(task_ids='raw_to_sss.add', key='return_value')[0] }}",
+            poke_interval=60,
+            timeout=3600,
+        )
+
+        add >> wait
+
+    # 6) Cleanup: delete from landing/<system>/source/<dataset>/ after EMR succeeds
+    cleanup_target_files = PythonOperator(
+        task_id="cleanup_target_files",
+        python_callable=_cleanup_target_files,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_SUCCESS)
+
+    # Dependencies
+    start >> file_watcher_group >> move_files_from_source_to_target >> branch
+    branch >> manual_intervention_full
+    branch >> skip_manual_intervention
+    [manual_intervention_full, skip_manual_intervention] >> gate_done
+    gate_done >> tg_l2r >> tg_r2s >> cleanup_target_files >> end
