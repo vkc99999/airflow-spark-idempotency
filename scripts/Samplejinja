@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import List, Optional, Tuple
-import os
 import re
 
 import boto3
@@ -33,14 +32,15 @@ CFG = {
     "sdlc_env": Variable.get("SDLC_ENV"),
     "ods_bucket": Variable.get("ODS_S3_BUCKET"),
 
-    "source_system": "{{ SOURCE_SYSTEM }}",
+    "source_root": "source",  # hardcoded per your Excel
+
     "source_dataset": "{{ SOURCE_DATASET }}",
 
-    "source_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/current",
-    "target_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/{{ SOURCE_DATASET }}",
+    "source_s3_path": "landing/source/current",
+    "target_s3_path": "landing/source/{{ SOURCE_DATASET }}",
+    "source_archive_s3_path": "landing/source/archive/{{ SOURCE_DATASET }}",
 
-    "source_archive_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/archive/{{ SOURCE_DATASET }}",
-    "control_archive_s3_path": "admin/archive/{{ SOURCE_SYSTEM }}/ctrlfile/ingestion",
+    "control_archive_s3_path": "admin/archive/source/ctrlfile/ingestion",
 
     "file_prefix": "{{ FILE_PREFIX }}",
 
@@ -51,8 +51,8 @@ CFG = {
     "raw_schema": "{{ RAW_SCHEMA }}",
 
     "raw_config_file": "{{ RAW_CONFIG_FILE }}",
-    "control_file_prefix": "{{ CONTROL_FILE_PREFIX }}",   # e.g. control_file_finance
-    "control_file_path": "{{ CONTROL_FILE_PATH }}",       # e.g. raw/finance/ctrlfile/ingestion/
+    "control_file_prefix": "{{ CONTROL_FILE_PREFIX }}",
+    "control_file_path": "{{ CONTROL_FILE_PATH }}",  # e.g. raw/source/ctrlfile/ingestion/
 
     "aws_conn_id": "aws_default",
     "emr_config_key": "admin/config/BMC_EMR.config",
@@ -83,8 +83,7 @@ class S3ObjectManager:
                 params["ContinuationToken"] = token
 
             resp = self.s3.list_objects_v2(**params)
-            contents = resp.get("Contents") or []
-            for obj in contents:
+            for obj in (resp.get("Contents") or []):
                 key = obj["Key"]
                 filename = key[len(prefix):] if key.startswith(prefix) else key.split("/")[-1]
                 if rx.match(filename):
@@ -130,7 +129,7 @@ class S3ObjectManager:
         archive_prefix = archive_prefix.rstrip("/") + "/"
         dest_key = archive_prefix + source_key.split("/")[-1]
         if not self.validate_source_exists(source_key):
-            raise AirflowFailException(f"Source missing for archive: s3://{self.bucket}/{source_key}")
+            raise AirflowFailException(f"Source missing: s3://{self.bucket}/{source_key}")
         self.copy_and_validate(source_key, dest_key)
         self.delete(source_key)
         return dest_key
@@ -165,17 +164,14 @@ def make_emr_step(name: str, script: str, args: List[str]) -> dict:
     return {
         "Name": name,
         "ActionOnFailure": "CONTINUE",
-        "HadoopJarStep": {
-            "Jar": "command-runner.jar",
-            "Args": ["bash", script] + args,
-        },
+        "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["bash", script] + args},
     }
 
 
 def args_landing_to_raw() -> List[str]:
     return [
         CFG["ods_bucket"],
-        CFG["source_system"],
+        CFG["source_root"],   # constant "source"
         CFG["raw_table"],
         "incremental",
         CFG["raw_schema"],
@@ -185,7 +181,7 @@ def args_landing_to_raw() -> List[str]:
 def args_raw_to_sss(control_file_key: str) -> List[str]:
     return [
         CFG["ods_bucket"],
-        CFG["source_system"],
+        CFG["source_root"],   # constant "source"
         CFG["raw_table"],
         control_file_key,
     ]
@@ -212,9 +208,7 @@ def _branch_on_file_type(**kwargs) -> str:
     if not meta:
         raise AirflowFailException(f"File does not match expected pattern: {fn}")
     kind, _, _ = meta
-    if kind == "Full":
-        return "manual_intervention_full"
-    return "skip_manual_intervention"
+    return "manual_intervention_full" if kind == "Full" else "skip_manual_intervention"
 
 
 def _manual_intervention_full() -> None:
@@ -249,7 +243,7 @@ def _get_batch_number(**kwargs) -> str:
 
     gbn = Get_Batch_number(
         bucket_name=ODS_BUCKET,
-        source_system=CFG["source_system"],
+        source_system=CFG["source_root"],  # constant "source"
         conf=CFG["raw_config_file"],
     )
     batch_num = gbn.get_raw_batch_number()
@@ -268,14 +262,16 @@ def _get_control_file(**kwargs) -> str:
 
     gbn = Get_Batch_number(
         bucket_name=ODS_BUCKET,
-        source_system=CFG["source_system"],
+        source_system=CFG["source_root"],  # constant "source"
         conf=CFG["raw_config_file"],
     )
 
     control_file_pattern = f"{CFG['control_file_prefix']}_20*_{batch_num}.json"
     control_files = gbn.list_s3_objects_wildcard(CFG["control_file_path"], control_file_pattern)
     if not control_files:
-        raise AirflowFailException(f"Unable to find control file: {CFG['control_file_path']}{control_file_pattern}")
+        raise AirflowFailException(
+            f"Unable to find control file: {CFG['control_file_path']}{control_file_pattern}"
+        )
     return control_files[0]
 
 
@@ -298,7 +294,7 @@ default_args = {"owner": "data-eng", "retries": 0, "retry_delay": timedelta(minu
 with DAG(
     dag_id=CFG["dag_id"],
     default_args=default_args,
-    description="Landing -> Target staging -> EMR steps -> Batch+Control -> Archive",
+    description="Landing -> Staging -> EMR -> Batch+Control -> EMR -> Archive",
     schedule=CFG["schedule"],
     start_date=pendulum.datetime(2025, 12, 1, tz="America/New_York"),
     catchup=False,
@@ -320,13 +316,10 @@ with DAG(
             mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
             src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
 
-            pattern = f"{CFG['file_prefix']}-??????????????-Full-*.tsv"
-            full_keys = mgr.list_s3_objects_wildcard(src_prefix, pattern)
+            full_pattern = f"{CFG['file_prefix']}-??????????????-Full-*.tsv"
+            inc_pattern = f"{CFG['file_prefix']}-??????????????-Incremental-*.tsv"
 
-            pattern = f"{CFG['file_prefix']}-??????????????-Incremental-*.tsv"
-            inc_keys = mgr.list_s3_objects_wildcard(src_prefix, pattern)
-
-            keys = full_keys + inc_keys
+            keys = mgr.list_s3_objects_wildcard(src_prefix, full_pattern) + mgr.list_s3_objects_wildcard(src_prefix, inc_pattern)
             if not keys:
                 return False
 
@@ -363,10 +356,7 @@ with DAG(
 
     skip_manual_intervention = EmptyOperator(task_id="skip_manual_intervention")
 
-    gate_done = EmptyOperator(
-        task_id="gate_done",
-        trigger_rule=TriggerRule.ONE_SUCCESS,
-    )
+    gate_done = EmptyOperator(task_id="gate_done", trigger_rule=TriggerRule.ONE_SUCCESS)
 
     with TaskGroup(group_id="landing_to_raw") as tg_l2r:
         add = EmrAddStepsOperator(
@@ -375,7 +365,7 @@ with DAG(
             aws_conn_id=CFG["aws_conn_id"],
             steps=[
                 make_emr_step(
-                    name=f"Landing->Raw {CFG['source_system']}/{CFG['source_dataset']}",
+                    name=f"Landing->Raw {CFG['source_dataset']}",
                     script=CFG["script_landing_to_raw"],
                     args=args_landing_to_raw(),
                 )
@@ -390,18 +380,10 @@ with DAG(
             poke_interval=60,
             timeout=3600,
         )
-
         add >> wait
 
-    get_batch_number = PythonOperator(
-        task_id="get_batch_number",
-        python_callable=_get_batch_number,
-    )
-
-    get_control_file = PythonOperator(
-        task_id="get_control_file",
-        python_callable=_get_control_file,
-    )
+    get_batch_number = PythonOperator(task_id="get_batch_number", python_callable=_get_batch_number)
+    get_control_file = PythonOperator(task_id="get_control_file", python_callable=_get_control_file)
 
     with TaskGroup(group_id="raw_to_sss") as tg_r2s:
         add = EmrAddStepsOperator(
@@ -410,7 +392,7 @@ with DAG(
             aws_conn_id=CFG["aws_conn_id"],
             steps=[
                 make_emr_step(
-                    name=f"Raw->SSS {CFG['source_system']}/{CFG['source_dataset']}",
+                    name=f"Raw->SSS {CFG['source_dataset']}",
                     script=CFG["script_raw_to_sss"],
                     args=args_raw_to_sss("{{ ti.xcom_pull(task_ids='get_control_file', key='return_value') }}"),
                 )
@@ -425,7 +407,6 @@ with DAG(
             poke_interval=60,
             timeout=3600,
         )
-
         add >> wait
 
     archive_files = PythonOperator(
