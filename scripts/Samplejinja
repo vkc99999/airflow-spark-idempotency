@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import List
+from typing import List, Optional, Tuple
+import os
+import re
 
 import boto3
+from botocore.exceptions import ClientError
+
 from airflow import DAG
 from airflow.exceptions import AirflowFailException
 from airflow.models import Variable
@@ -17,9 +21,6 @@ from airflow.utils.trigger_rule import TriggerRule
 from airflow.decorators import task
 import pendulum
 
-# -----------------------
-# Config (template-style)
-# -----------------------
 CFG = {
     "dag_id": "lakehouse_in_clinical_source_load_{{ SOURCE_DATASET }}",
     "tags": [{{ DAG_TAGS }}],
@@ -35,18 +36,23 @@ CFG = {
     "source_system": "{{ SOURCE_SYSTEM }}",
     "source_dataset": "{{ SOURCE_DATASET }}",
 
-    # landing/<system>/source/current/
     "source_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/current",
-    # landing/<system>/source/<dataset>/
     "target_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/{{ SOURCE_DATASET }}",
 
-    # EMR scripts (keep same as your reference)
+    "source_archive_s3_path": "landing/{{ SOURCE_SYSTEM }}/source/archive/{{ SOURCE_DATASET }}",
+    "control_archive_s3_path": "admin/archive/{{ SOURCE_SYSTEM }}/ctrlfile/ingestion",
+
+    "file_prefix": "{{ FILE_PREFIX }}",
+
     "script_landing_to_raw": "/home/hadoop/ods-utilities/landingToRawS3.sh",
     "script_raw_to_sss": "/home/hadoop/batch-process/ods-raw-delta-process.sh",
 
-    # If your reference uses raw_table/raw_schema, keep them templated
     "raw_table": "{{ RAW_TABLE }}",
     "raw_schema": "{{ RAW_SCHEMA }}",
+
+    "raw_config_file": "{{ RAW_CONFIG_FILE }}",
+    "control_file_prefix": "{{ CONTROL_FILE_PREFIX }}",   # e.g. control_file_finance
+    "control_file_path": "{{ CONTROL_FILE_PATH }}",       # e.g. raw/finance/ctrlfile/ingestion/
 
     "aws_conn_id": "aws_default",
     "emr_config_key": "admin/config/BMC_EMR.config",
@@ -55,9 +61,81 @@ CFG = {
 ODS_BUCKET = CFG["ods_bucket"]
 
 
-# -----------------------
-# Helper functions
-# -----------------------
+class S3ObjectManager:
+    def __init__(self, bucket: str, aws_conn_id: str):
+        self.bucket = bucket
+        self.s3 = S3Hook(aws_conn_id=aws_conn_id).get_conn()
+
+    @staticmethod
+    def _wildcard_to_regex(pattern: str) -> re.Pattern:
+        regex = pattern.replace(".", r"\.").replace("*", ".*").replace("?", ".")
+        return re.compile(rf"^{regex}$")
+
+    def list_s3_objects_wildcard(self, prefix: str, filename_pattern: str) -> List[str]:
+        rx = self._wildcard_to_regex(filename_pattern)
+        prefix = prefix.rstrip("/") + "/"
+        matching: List[str] = []
+        token = None
+
+        while True:
+            params = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if token:
+                params["ContinuationToken"] = token
+
+            resp = self.s3.list_objects_v2(**params)
+            contents = resp.get("Contents") or []
+            for obj in contents:
+                key = obj["Key"]
+                filename = key[len(prefix):] if key.startswith(prefix) else key.split("/")[-1]
+                if rx.match(filename):
+                    matching.append(key)
+
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+
+        return matching
+
+    def head(self, key: str) -> dict:
+        return self.s3.head_object(Bucket=self.bucket, Key=key)
+
+    def validate_source_exists(self, key: str) -> bool:
+        try:
+            self.head(key)
+            return True
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("404", "NoSuchKey"):
+                return False
+            raise
+
+    def copy_and_validate(self, source_key: str, dest_key: str) -> None:
+        src = self.head(source_key)
+        self.s3.copy_object(
+            CopySource={"Bucket": self.bucket, "Key": source_key},
+            Bucket=self.bucket,
+            Key=dest_key,
+        )
+        dst = self.head(dest_key)
+        if src.get("ContentLength", 0) != dst.get("ContentLength", -1):
+            raise AirflowFailException(
+                f"Copy size mismatch: {source_key} -> {dest_key} "
+                f"(src={src.get('ContentLength')}, dst={dst.get('ContentLength')})"
+            )
+
+    def delete(self, key: str) -> None:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def archive(self, source_key: str, archive_prefix: str) -> str:
+        archive_prefix = archive_prefix.rstrip("/") + "/"
+        dest_key = archive_prefix + source_key.split("/")[-1]
+        if not self.validate_source_exists(source_key):
+            raise AirflowFailException(f"Source missing for archive: s3://{self.bucket}/{source_key}")
+        self.copy_and_validate(source_key, dest_key)
+        self.delete(source_key)
+        return dest_key
+
+
 def _get_emr_id() -> str:
     s3 = boto3.resource("s3")
     body = (
@@ -95,106 +173,132 @@ def make_emr_step(name: str, script: str, args: List[str]) -> dict:
 
 
 def args_landing_to_raw() -> List[str]:
-    # Match your reference pattern; adjust only if reference differs
-    # e.g. [bucket, source_system, raw_table, "incremental", raw_schema]
     return [
         CFG["ods_bucket"],
         CFG["source_system"],
         CFG["raw_table"],
-        "incremental",          # framework doesn’t distinguish; full handled by manual step
+        "incremental",
         CFG["raw_schema"],
     ]
 
 
-def args_raw_to_sss() -> List[str]:
-    # Keep same style as reference. If reference uses ctrl file path, build/push it similarly.
-    # For now, placeholder minimal args — replace with your exact reference args.
+def args_raw_to_sss(control_file_key: str) -> List[str]:
     return [
         CFG["ods_bucket"],
         CFG["source_system"],
         CFG["raw_table"],
+        control_file_key,
     ]
+
+
+def _parse_file_metadata(filename: str, file_prefix: str) -> Optional[Tuple[str, int, str]]:
+    rx = re.compile(rf"^{re.escape(file_prefix)}-(\d{{14}})-(Full|Incremental)-(\d+)\.tsv$")
+    m = rx.match(filename)
+    if not m:
+        return None
+    ts = m.group(1)
+    kind = m.group(2)
+    n = int(m.group(3))
+    return kind, n, ts
 
 
 def _branch_on_file_type(**kwargs) -> str:
     ti = kwargs["ti"]
-    sensor_task_id = f"FILE_WATCHER.s3_file_sensor_task"
-    s3_key = ti.xcom_pull(task_ids=sensor_task_id)
+    s3_key = ti.xcom_pull(task_ids="FILE_WATCHER.s3_file_sensor_task")
     if not s3_key:
         raise AirflowFailException("No file found by sensor.")
-
     fn = s3_key.split("/")[-1]
-    if "-Full-" in fn:
+    meta = _parse_file_metadata(fn, CFG["file_prefix"])
+    if not meta:
+        raise AirflowFailException(f"File does not match expected pattern: {fn}")
+    kind, _, _ = meta
+    if kind == "Full":
         return "manual_intervention_full"
     return "skip_manual_intervention"
 
 
 def _manual_intervention_full() -> None:
-    # Intentionally FAIL.
-    # You clean up table manually, then Mark Success in UI to continue.
     raise AirflowFailException(
         "FULL load detected. Clean up target table manually, then Mark this task SUCCESS to proceed."
     )
 
 
-def _move_s3_files(**kwargs) -> List[str]:
-    """
-    Move .tsv files from source/current/ to source/<dataset>/ and delete from current/.
-    Stores moved keys in XCom: processed_files_list
-    """
+def _move_selected_file(**kwargs) -> str:
     ti = kwargs["ti"]
-    s3 = S3Hook(aws_conn_id=CFG["aws_conn_id"])
+    mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
+
+    src_key = ti.xcom_pull(task_ids="FILE_WATCHER.s3_file_sensor_task")
+    if not src_key:
+        raise AirflowFailException("No file selected by sensor.")
 
     src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
     tgt_prefix = CFG["target_s3_path"].rstrip("/") + "/"
+    if not src_key.startswith(src_prefix):
+        raise AirflowFailException(f"Selected key not under source prefix: {src_key}")
 
-    keys = s3.list_keys(bucket_name=ODS_BUCKET, prefix=src_prefix) or []
-    to_move = [k for k in keys if k.endswith(".tsv")]
+    dest_key = tgt_prefix + src_key.split("/")[-1]
+    mgr.copy_and_validate(src_key, dest_key)
+    mgr.delete(src_key)
 
-    if not to_move:
-        raise AirflowFailException(f"No .tsv files found under s3://{ODS_BUCKET}/{src_prefix}")
-
-    moved = []
-    for k in to_move:
-        new_key = k.replace(src_prefix, tgt_prefix, 1)
-        s3.copy_object(
-            source_bucket_key=k,
-            dest_bucket_key=new_key,
-            source_bucket_name=ODS_BUCKET,
-            dest_bucket_name=ODS_BUCKET,
-        )
-        s3.delete_objects(bucket=ODS_BUCKET, keys=[k])
-        moved.append(new_key)
-
-    ti.xcom_push(key="processed_files_list", value=moved)
-    return moved
+    ti.xcom_push(key="moved_source_key", value=dest_key)
+    return dest_key
 
 
-def _cleanup_target_files(**kwargs) -> None:
-    """
-    After all EMR steps succeed, delete the moved files from landing/<system>/source/<dataset>/
-    """
+def _get_batch_number(**kwargs) -> str:
+    from packages.get_batch_number import Get_Batch_number
+
+    gbn = Get_Batch_number(
+        bucket_name=ODS_BUCKET,
+        source_system=CFG["source_system"],
+        conf=CFG["raw_config_file"],
+    )
+    batch_num = gbn.get_raw_batch_number()
+    if not batch_num:
+        raise AirflowFailException("Unable to fetch batch number.")
+    return str(batch_num)
+
+
+def _get_control_file(**kwargs) -> str:
+    from packages.get_batch_number import Get_Batch_number
+
     ti = kwargs["ti"]
-    s3 = S3Hook(aws_conn_id=CFG["aws_conn_id"])
-    moved = ti.xcom_pull(task_ids="move_files_from_source_to_target", key="processed_files_list") or []
-    if not moved:
-        return
-    s3.delete_objects(bucket=ODS_BUCKET, keys=moved)
+    batch_num = ti.xcom_pull(task_ids="get_batch_number", key="return_value")
+    if not batch_num:
+        raise AirflowFailException("Batch number missing; cannot find control file.")
+
+    gbn = Get_Batch_number(
+        bucket_name=ODS_BUCKET,
+        source_system=CFG["source_system"],
+        conf=CFG["raw_config_file"],
+    )
+
+    control_file_pattern = f"{CFG['control_file_prefix']}_20*_{batch_num}.json"
+    control_files = gbn.list_s3_objects_wildcard(CFG["control_file_path"], control_file_pattern)
+    if not control_files:
+        raise AirflowFailException(f"Unable to find control file: {CFG['control_file_path']}{control_file_pattern}")
+    return control_files[0]
 
 
-# -----------------------
-# DAG
-# -----------------------
-default_args = {
-    "owner": "data-eng",
-    "retries": 0,  # important: manual intervention should not keep retrying
-    "retry_delay": timedelta(minutes=5),
-}
+def _archive_files(**kwargs) -> None:
+    ti = kwargs["ti"]
+    mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
+
+    moved_key = ti.xcom_pull(task_ids="move_file_from_current_to_dataset", key="moved_source_key")
+    if not moved_key:
+        raise AirflowFailException("Moved source key missing; cannot archive source file.")
+    mgr.archive(moved_key, CFG["source_archive_s3_path"])
+
+    control_key = ti.xcom_pull(task_ids="get_control_file", key="return_value")
+    if control_key:
+        mgr.archive(control_key, CFG["control_archive_s3_path"])
+
+
+default_args = {"owner": "data-eng", "retries": 0, "retry_delay": timedelta(minutes=5)}
 
 with DAG(
     dag_id=CFG["dag_id"],
     default_args=default_args,
-    description="Landing -> Target staging -> EMR steps -> Cleanup",
+    description="Landing -> Target staging -> EMR steps -> Batch+Control -> Archive",
     schedule=CFG["schedule"],
     start_date=pendulum.datetime(2025, 12, 1, tz="America/New_York"),
     catchup=False,
@@ -204,7 +308,6 @@ with DAG(
 
     start = EmptyOperator(task_id="start")
 
-    # 1) File watcher (returns one key)
     with TaskGroup(group_id="FILE_WATCHER") as file_watcher_group:
 
         @task.sensor(
@@ -214,23 +317,40 @@ with DAG(
             timeout=CFG["sensor_timeout"],
         )
         def s3_file_sensor():
-            s3 = S3Hook(aws_conn_id=CFG["aws_conn_id"])
+            mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
             src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
-            keys = s3.list_keys(bucket_name=ODS_BUCKET, prefix=src_prefix) or []
+
+            pattern = f"{CFG['file_prefix']}-??????????????-Full-*.tsv"
+            full_keys = mgr.list_s3_objects_wildcard(src_prefix, pattern)
+
+            pattern = f"{CFG['file_prefix']}-??????????????-Incremental-*.tsv"
+            inc_keys = mgr.list_s3_objects_wildcard(src_prefix, pattern)
+
+            keys = full_keys + inc_keys
+            if not keys:
+                return False
+
+            candidates = []
             for k in keys:
-                if k.endswith(".tsv"):
-                    return k
-            return False
+                fn = k.split("/")[-1]
+                meta = _parse_file_metadata(fn, CFG["file_prefix"])
+                if meta:
+                    kind, n, ts = meta
+                    candidates.append((n, ts, k))
+
+            if not candidates:
+                return False
+
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            return candidates[0][2]
 
         s3_file_sensor()
 
-    # 2) Move current -> dataset folder (always)
-    move_files_from_source_to_target = PythonOperator(
-        task_id="move_files_from_source_to_target",
-        python_callable=_move_s3_files,
+    move_file_from_current_to_dataset = PythonOperator(
+        task_id="move_file_from_current_to_dataset",
+        python_callable=_move_selected_file,
     )
 
-    # 3) Full vs Incremental gate (full = manual intervention)
     branch = BranchPythonOperator(
         task_id="branch_on_load_type",
         python_callable=_branch_on_file_type,
@@ -245,12 +365,10 @@ with DAG(
 
     gate_done = EmptyOperator(
         task_id="gate_done",
-        trigger_rule=TriggerRule.ONE_SUCCESS,  # manual marked success OR incremental skip
+        trigger_rule=TriggerRule.ONE_SUCCESS,
     )
 
-    # 4) EMR: Landing -> Raw (TaskGroup with add+wait)
     with TaskGroup(group_id="landing_to_raw") as tg_l2r:
-
         add = EmrAddStepsOperator(
             task_id="add",
             job_flow_id=EMR_CLUSTER_ID,
@@ -275,9 +393,17 @@ with DAG(
 
         add >> wait
 
-    # 5) EMR: Raw -> SSS (TaskGroup with add+wait)
-    with TaskGroup(group_id="raw_to_sss") as tg_r2s:
+    get_batch_number = PythonOperator(
+        task_id="get_batch_number",
+        python_callable=_get_batch_number,
+    )
 
+    get_control_file = PythonOperator(
+        task_id="get_control_file",
+        python_callable=_get_control_file,
+    )
+
+    with TaskGroup(group_id="raw_to_sss") as tg_r2s:
         add = EmrAddStepsOperator(
             task_id="add",
             job_flow_id=EMR_CLUSTER_ID,
@@ -286,7 +412,7 @@ with DAG(
                 make_emr_step(
                     name=f"Raw->SSS {CFG['source_system']}/{CFG['source_dataset']}",
                     script=CFG["script_raw_to_sss"],
-                    args=args_raw_to_sss(),  # replace with your exact reference args
+                    args=args_raw_to_sss("{{ ti.xcom_pull(task_ids='get_control_file', key='return_value') }}"),
                 )
             ],
         )
@@ -302,18 +428,17 @@ with DAG(
 
         add >> wait
 
-    # 6) Cleanup: delete from landing/<system>/source/<dataset>/ after EMR succeeds
-    cleanup_target_files = PythonOperator(
-        task_id="cleanup_target_files",
-        python_callable=_cleanup_target_files,
+    archive_files = PythonOperator(
+        task_id="archive_files",
+        python_callable=_archive_files,
         trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
     end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_SUCCESS)
 
-    # Dependencies
-    start >> file_watcher_group >> move_files_from_source_to_target >> branch
+    start >> file_watcher_group >> move_file_from_current_to_dataset >> branch
     branch >> manual_intervention_full
     branch >> skip_manual_intervention
     [manual_intervention_full, skip_manual_intervention] >> gate_done
-    gate_done >> tg_l2r >> tg_r2s >> cleanup_target_files >> end
+
+    gate_done >> tg_l2r >> get_batch_number >> get_control_file >> tg_r2s >> archive_files >> end
