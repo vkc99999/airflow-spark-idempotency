@@ -1,3 +1,5 @@
+# RESOLVED EXAMPLE (DEV TEST)
+
 from __future__ import annotations
 
 import os
@@ -21,9 +23,9 @@ from airflow.utils.trigger_rule import TriggerRule
 
 
 CFG = {
-    "dag_id": "lakehouse_in_clinical_source_load_{{ SOURCE_DATASET }}",
-    "tags": [{{ DAG_TAGS }}],
-    "schedule": {{ SCHEDULE }},
+    "dag_id": "lakehouse_in_clinical_source_load_code_collection_dim",
+    "tags": ["lakehouse", "clinical"],
+    "schedule": None,
     "max_active_runs": 1,
 
     "sensor_poke_interval": 4 * 60 * 60,
@@ -33,34 +35,28 @@ CFG = {
     "ods_bucket": Variable.get("ODS_S3_BUCKET"),
     "sdlc_env": Variable.get("SDLC_ENV"),
 
-    "emr_name": "{{ EMR_CONFIG_NAME }}",
+    "emr_name": "CUSTOMER_LAKE_EMR_P",
     "emr_config_key": "admin/config/BMC_EMR.config",
 
-    "source_dataset": "{{ SOURCE_DATASET }}",
+    "source_dataset": "code_collection_dim",
 
-    # Excel-based: landing/source/current/ -> landing/source/<dataset>/
     "source_s3_path": "landing/source/current",
-    "target_s3_path": "landing/source/{{ SOURCE_DATASET }}",
-    "archive_s3_path": "landing/source/archive/{{ SOURCE_DATASET }}",
+    "target_s3_path": "landing/source/code_collection_dim",
+    "archive_s3_path": "landing/source/archive/code_collection_dim",
 
-    # Excel-based file pattern needs a file prefix (e.g., CodeCollectionDimension)
-    "file_prefix": "{{ FILE_PREFIX }}",
+    "file_prefix": "CodeCollectionDimension",
 
-    # Control file locations (Excel-based)
     "control_file_path": "raw/source/ctrlfile/ingestion/",
     "control_file_archive_path": "admin/archive/source/ctrlfile/ingestion/",
-    "control_file_prefix": "{{ CONTROL_FILE_PREFIX }}",  # e.g., control_file_source OR control_file_<dataset>
+    "control_file_prefix": "control_file_source",
 
-    # Keep your EMR scripts AS-IS (paths unchanged)
     "script_landing_to_raw": "/home/hadoop/ods-utilities/landingToRawS3.sh",
     "script_raw_to_sss": "/home/hadoop/batch-process/ods-raw-delta-process.sh",
 
-    # If your existing framework uses these values, keep them templated
-    "source_system_name_for_emr": "{{ SOURCE_SYSTEM_NAME }}",          # e.g., source
-    "resource_link_name_for_emr": "{{ RESOURCE_LINK_NAME }}",          # e.g., rl_raw_source
+    "source_system_name_for_emr": "source",
+    "resource_link_name_for_emr": "rl_raw_source",
 
-    # If your batch/control tasks depend on an internal config file, keep it templated
-    "config_file": "{{ ODS_CONFIG_FILE }}",                            # e.g., admin/domains/lakehouse/raw/SOURCE/config/ods.config
+    "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
 }
 
 ODS_BUCKET = CFG["ods_bucket"]
@@ -146,22 +142,12 @@ def make_emr_step(name: str, script: str, args: List[str]) -> dict:
     return {
         "Name": name,
         "ActionOnFailure": "CONTINUE",
-        "HadoopJarStep": {
-            "Jar": "command-runner.jar",
-            "Args": ["bash", script] + args,
-        },
+        "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["bash", script] + args},
     }
 
 
 def _select_batch_from_current(keys: List[str], file_prefix: str) -> Tuple[str, str, List[str]]:
-    """
-    Returns: (load_type, batch_timestamp, ordered_keys)
-    Pattern (Excel): <Prefix>-YYYYMMDDHHMMSS-(Full|Incremental)-N.tsv
-    """
-    rgx = re.compile(
-        rf"^{re.escape(file_prefix)}-(\d{{14}})-(Full|Incremental)-(\d+)\.tsv$"
-    )
-
+    rgx = re.compile(rf"^{re.escape(file_prefix)}-(\d{{14}})-(Full|Incremental)-(\d+)\.tsv$")
     candidates = []
     for k in keys:
         fn = k.split("/")[-1]
@@ -172,51 +158,37 @@ def _select_batch_from_current(keys: List[str], file_prefix: str) -> Tuple[str, 
         lt = m.group(2)
         seq = int(m.group(3))
         candidates.append((ts, lt, seq, k))
-
     if not candidates:
         raise AirflowFailException("No matching .tsv files found for the expected pattern.")
 
     candidates.sort(key=lambda x: (x[0], 0 if x[1] == "Full" else 1, x[2]))
     batch_ts, batch_lt, _, _ = candidates[0]
-
     batch = [c for c in candidates if c[0] == batch_ts and c[1] == batch_lt]
     batch.sort(key=lambda x: x[2])
-
-    ordered_keys = [b[3] for b in batch]
-    return batch_lt, batch_ts, ordered_keys
+    return batch_lt, batch_ts, [b[3] for b in batch]
 
 
 def _manual_intervention_full() -> None:
-    raise AirflowFailException(
-        "FULL load detected. Clean up target table manually, then Mark this task SUCCESS to proceed."
-    )
+    raise AirflowFailException("FULL load detected. Clean up target table manually, then Mark SUCCESS to proceed.")
 
 
 def _branch_on_load_type(**kwargs) -> str:
-    ti = kwargs["ti"]
-    load_type = ti.xcom_pull(task_ids="select_files_batch", key="load_type")
-    if load_type == "Full":
-        return "manual_intervention_full"
-    return "skip_manual_intervention"
+    load_type = kwargs["ti"].xcom_pull(task_ids="select_files_batch", key="load_type")
+    return "manual_intervention_full" if load_type == "Full" else "skip_manual_intervention"
 
 
 def _move_selected_files(**kwargs) -> List[str]:
     ti = kwargs["ti"]
     mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
-
     src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
     tgt_prefix = CFG["target_s3_path"].rstrip("/") + "/"
-
     selected = ti.xcom_pull(task_ids="select_files_batch", key="selected_keys") or []
     if not selected:
         raise AirflowFailException("No selected keys found to move.")
 
     moved: List[str] = []
     for k in selected:
-        if not k.startswith(src_prefix):
-            raise AirflowFailException(f"Unexpected key outside current/ prefix: {k}")
         new_key = k.replace(src_prefix, tgt_prefix, 1)
-
         mgr.s3.copy_object(
             source_bucket_key=k,
             dest_bucket_key=new_key,
@@ -224,8 +196,7 @@ def _move_selected_files(**kwargs) -> List[str]:
             dest_bucket_name=ODS_BUCKET,
         )
         if not mgr.validate_copy(k, new_key):
-            raise AirflowFailException(f"Move copy validation failed: {k} -> {new_key}")
-
+            raise AirflowFailException(f"Move validation failed: {k} -> {new_key}")
         mgr.s3.delete_objects(bucket=ODS_BUCKET, keys=[k])
         moved.append(new_key)
 
@@ -235,23 +206,14 @@ def _move_selected_files(**kwargs) -> List[str]:
 
 def _get_emr_id_runtime() -> str:
     s3 = boto3.resource("s3")
-    body = (
-        s3.Object(ODS_BUCKET, CFG["emr_config_key"])
-        .get()["Body"]
-        .read()
-        .decode("utf-8")
-    )
-
+    body = s3.Object(ODS_BUCKET, CFG["emr_config_key"]).get()["Body"].read().decode("utf-8")
     matches = []
     for line in body.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) > 3 and parts[0] == CFG["emr_name"].strip():
             matches.append(parts[3])
-
     if not matches:
-        raise AirflowFailException(
-            f"EMR cluster '{CFG['emr_name']}' not found in s3://{ODS_BUCKET}/{CFG['emr_config_key']}"
-        )
+        raise AirflowFailException(f"EMR cluster '{CFG['emr_name']}' not found.")
     return matches[0].strip()
 
 
@@ -266,23 +228,17 @@ def args_landing_to_raw(load_type: str) -> List[str]:
 
 
 def args_raw_to_sss(control_file_key: str) -> List[str]:
-    return [
-        CFG["ods_bucket"],
-        CFG["source_system_name_for_emr"],
-        CFG["source_dataset"],
-        control_file_key,
-    ]
+    return [CFG["ods_bucket"], CFG["source_system_name_for_emr"], CFG["source_dataset"], control_file_key]
 
 
 def _get_batch_number(**kwargs) -> str:
-    from packages.get_batch_number import Get_Batch_number  # noqa: F401
+    from packages.get_batch_number import Get_Batch_number
 
     obj = Get_Batch_number(
         bucket_name=CFG["ods_bucket"],
         source_system=CFG["source_system_name_for_emr"],
         conf=CFG["config_file"],
     )
-
     batch = obj.get_raw_batch_number()
     if batch is None:
         raise AirflowFailException("Unable to determine batch number.")
@@ -292,18 +248,12 @@ def _get_batch_number(**kwargs) -> str:
 def _get_control_file(**kwargs) -> str:
     ti = kwargs["ti"]
     batch_number = ti.xcom_pull(task_ids="get_batch_number")
-    if not batch_number:
-        raise AirflowFailException("Batch number missing.")
-
     mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
     prefix = CFG["control_file_path"].rstrip("/") + "/"
-
     pattern = f"{CFG['control_file_prefix']}_20*_{batch_number}.json"
     matches = mgr.list_s3_objects_wildcard(prefix=prefix, filename_pattern=pattern)
-
     if not matches:
-        raise AirflowFailException(f"Control file not found under {prefix} with pattern {pattern}")
-
+        raise AirflowFailException("Control file not found.")
     matches.sort()
     return matches[0]
 
@@ -316,16 +266,10 @@ def _archive_all(**kwargs) -> None:
     control_file_key = ti.xcom_pull(task_ids="get_control_file")
 
     if control_file_key:
-        mgr.copy_then_delete(
-            source_key=control_file_key,
-            destination_prefix=CFG["control_file_archive_path"],
-        )
+        mgr.copy_then_delete(source_key=control_file_key, destination_prefix=CFG["control_file_archive_path"])
 
     for k in moved_tsv:
-        mgr.copy_then_delete(
-            source_key=k,
-            destination_prefix=CFG["archive_s3_path"],
-        )
+        mgr.copy_then_delete(source_key=k, destination_prefix=CFG["archive_s3_path"])
 
 
 default_args = {"owner": "data-eng", "retries": 0, "retry_delay": timedelta(minutes=5)}
@@ -343,19 +287,12 @@ with DAG(
 
     with TaskGroup(group_id="FILE_WATCHER") as file_watcher_group:
 
-        @task.sensor(
-            task_id="s3_file_sensor_task",
-            mode="reschedule",
-            poke_interval=CFG["sensor_poke_interval"],
-            timeout=CFG["sensor_timeout"],
-        )
+        @task.sensor(task_id="s3_file_sensor_task", mode="reschedule",
+                     poke_interval=CFG["sensor_poke_interval"], timeout=CFG["sensor_timeout"])
         def s3_file_sensor():
             mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
             src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
-
-            pattern = rf"^{re.escape(CFG['file_prefix'])}-\d{{14}}-(Full|Incremental)-\d+\.tsv$"
-            rgx = re.compile(pattern)
-
+            rgx = re.compile(rf"^{re.escape(CFG['file_prefix'])}-\d{{14}}-(Full|Incremental)-\d+\.tsv$")
             keys = mgr.s3.list_keys(bucket_name=ODS_BUCKET, prefix=src_prefix) or []
             for k in keys:
                 if rgx.match(k.split("/")[-1]):
@@ -369,58 +306,30 @@ with DAG(
         mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
         src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
         keys = mgr.s3.list_keys(bucket_name=ODS_BUCKET, prefix=src_prefix) or []
-
         load_type, batch_ts, selected = _select_batch_from_current(keys, CFG["file_prefix"])
         ti.xcom_push(key="load_type", value=load_type)
         ti.xcom_push(key="batch_ts", value=batch_ts)
         ti.xcom_push(key="selected_keys", value=selected)
 
-    select_files_batch = PythonOperator(
-        task_id="select_files_batch",
-        python_callable=_select_files_batch,
-    )
+    select_files_batch = PythonOperator(task_id="select_files_batch", python_callable=_select_files_batch)
+    move_selected_files = PythonOperator(task_id="move_selected_files", python_callable=_move_selected_files)
 
-    move_selected_files = PythonOperator(
-        task_id="move_selected_files",
-        python_callable=_move_selected_files,
-    )
-
-    branch = BranchPythonOperator(
-        task_id="branch_on_load_type",
-        python_callable=_branch_on_load_type,
-    )
-
-    manual_intervention_full = PythonOperator(
-        task_id="manual_intervention_full",
-        python_callable=_manual_intervention_full,
-    )
-
+    branch = BranchPythonOperator(task_id="branch_on_load_type", python_callable=_branch_on_load_type)
+    manual_intervention_full = PythonOperator(task_id="manual_intervention_full", python_callable=_manual_intervention_full)
     skip_manual_intervention = EmptyOperator(task_id="skip_manual_intervention")
+    gate_done = EmptyOperator(task_id="gate_done", trigger_rule=TriggerRule.ONE_SUCCESS)
 
-    gate_done = EmptyOperator(
-        task_id="gate_done",
-        trigger_rule=TriggerRule.ONE_SUCCESS,
-    )
-
-    get_emr_id = PythonOperator(
-        task_id="get_emr_id",
-        python_callable=_get_emr_id_runtime,
-    )
+    get_emr_id = PythonOperator(task_id="get_emr_id", python_callable=_get_emr_id_runtime)
 
     with TaskGroup(group_id="landing_to_raw") as tg_l2r:
         add = EmrAddStepsOperator(
             task_id="add",
             job_flow_id="{{ ti.xcom_pull(task_ids='get_emr_id') }}",
             aws_conn_id=CFG["aws_conn_id"],
-            steps=[
-                make_emr_step(
-                    name=f"Landing->Raw {CFG['source_dataset']}",
-                    script=CFG["script_landing_to_raw"],
-                    args=args_landing_to_raw("{{ ti.xcom_pull(task_ids='select_files_batch', key='load_type') }}"),
-                )
-            ],
+            steps=[make_emr_step("Landing->Raw code_collection_dim",
+                                 CFG["script_landing_to_raw"],
+                                 args_landing_to_raw("{{ ti.xcom_pull(task_ids='select_files_batch', key='load_type') }}"))],
         )
-
         wait = EmrStepSensor(
             task_id="wait",
             job_flow_id="{{ ti.xcom_pull(task_ids='get_emr_id') }}",
@@ -429,33 +338,20 @@ with DAG(
             poke_interval=60,
             timeout=3600,
         )
-
         add >> wait
 
-    get_batch_number = PythonOperator(
-        task_id="get_batch_number",
-        python_callable=_get_batch_number,
-    )
-
-    get_control_file = PythonOperator(
-        task_id="get_control_file",
-        python_callable=_get_control_file,
-    )
+    get_batch_number = PythonOperator(task_id="get_batch_number", python_callable=_get_batch_number)
+    get_control_file = PythonOperator(task_id="get_control_file", python_callable=_get_control_file)
 
     with TaskGroup(group_id="raw_to_sss") as tg_r2s:
         add = EmrAddStepsOperator(
             task_id="add",
             job_flow_id="{{ ti.xcom_pull(task_ids='get_emr_id') }}",
             aws_conn_id=CFG["aws_conn_id"],
-            steps=[
-                make_emr_step(
-                    name=f"Raw->SSS {CFG['source_dataset']}",
-                    script=CFG["script_raw_to_sss"],
-                    args=args_raw_to_sss("{{ ti.xcom_pull(task_ids='get_control_file') }}"),
-                )
-            ],
+            steps=[make_emr_step("Raw->SSS code_collection_dim",
+                                 CFG["script_raw_to_sss"],
+                                 args_raw_to_sss("{{ ti.xcom_pull(task_ids='get_control_file') }}"))],
         )
-
         wait = EmrStepSensor(
             task_id="wait",
             job_flow_id="{{ ti.xcom_pull(task_ids='get_emr_id') }}",
@@ -464,15 +360,9 @@ with DAG(
             poke_interval=60,
             timeout=3600,
         )
-
         add >> wait
 
-    archive_all = PythonOperator(
-        task_id="archive_all",
-        python_callable=_archive_all,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
-
+    archive_all = PythonOperator(task_id="archive_all", python_callable=_archive_all, trigger_rule=TriggerRule.ALL_SUCCESS)
     end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_SUCCESS)
 
     start >> file_watcher_group >> select_files_batch >> move_selected_files >> branch
