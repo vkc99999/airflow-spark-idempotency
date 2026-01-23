@@ -1,3 +1,27 @@
+# example: code_collection_dim.yaml
+
+# DAG identity
+SOURCE_DATASET: "code_collection_dim"
+TAGS: "'lakehouse','IM-Clinical','microbatch-merge','source-code-collection-dim'"
+
+# EMR + scheduling
+EMR_NAME: "CUSTOMER_LAKE_EMR_P"
+SCHEDULE: "None"   # or "'0 6 * * *'" for cron; keep as a python string in the template
+
+# Landing file matching (used by watcher to pick the right files)
+# Example pattern from your excel: CodeCollectionDimension-YYYYMMDDHHMMSS-(Full|Incremental)-N.tsv
+FILE_PREFIX: "CodeCollectionDimension"
+
+# LandingToRaw args (these ARE typically required because the script needs to know raw target)
+RAW_TABLE: "code_collection_dim"
+RAW_SCHEMA: "rl_raw_source"
+
+# Raw batch/control file discovery (runs between landingToRaw and rawToSSS)
+RAW_CONFIG_FILE: "admin/domains/lakehouse/raw/SOURCE/config/ods.config"
+CONTROL_FILE_PREFIX: "control_file_source"
+CONTROL_FILE_PATH: "raw/source/ctrlfile/ingestion/"
+
+
 # RESOLVED EXAMPLE (DEV TEST)
 
 from __future__ import annotations
