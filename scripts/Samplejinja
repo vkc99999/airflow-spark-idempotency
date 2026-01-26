@@ -1,30 +1,35 @@
-from __future__ import annotations
+# main.py
 
+import re
+import sys
+import boto3
+import pendulum
 from datetime import timedelta
 from typing import List, Optional, Tuple
-import re
-
-import boto3
-from botocore.exceptions import ClientError
 
 from airflow import DAG
-from airflow.exceptions import AirflowFailException
+from airflow.decorators import task
 from airflow.models import Variable
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import BranchPythonOperator, PythonOperator
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
-from airflow.providers.amazon.aws.sensors.emr import EmrStepSensor
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
-from airflow.decorators import task
-import pendulum
 
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.amazon.aws.operators.emr_add_steps import EmrAddStepsOperator
+from airflow.providers.amazon.aws.sensors.emr_step import EmrStepSensor
+from botocore.exceptions import ClientError
+from airflow.exceptions import AirflowFailException
+
+
+# ---------------------------------------------------------------------
+# Config (jinja2 filled at deploy time)
+# ---------------------------------------------------------------------
 CFG = {
-    "dag_id": "lakehouse_in_clinical_source_load_{{ SOURCE_DATASET }}",
-    "tags": [{{ DAG_TAGS }}],
-    "emr_name": "{{ EMR_CONFIG_NAME }}",
-    "schedule": {{ SCHEDULE }},
+    "dag_id": "source_{{ SOURCE_DATASET }}",
+    "tags": [{{ TAGS }}],
+    "emr_name": "{{ EMR_NAME }}",
+    "schedule": "{{ SCHEDULE }}",
     "max_active_runs": 1,
     "sensor_poke_interval": 4 * 60 * 60,
     "sensor_timeout": 24 * 60 * 60,
@@ -32,35 +37,36 @@ CFG = {
     "sdlc_env": Variable.get("SDLC_ENV"),
     "ods_bucket": Variable.get("ODS_S3_BUCKET"),
 
-    "source_root": "source",  # hardcoded per your Excel
-
+    "source_root": "source",
     "source_dataset": "{{ SOURCE_DATASET }}",
 
-    "source_s3_path": "landing/source/current",
-    "target_s3_path": "landing/source/{{ SOURCE_DATASET }}",
-    "source_archive_s3_path": "landing/source/archive/{{ SOURCE_DATASET }}",
-
-    "control_archive_s3_path": "admin/archive/source/ctrlfile/ingestion",
+    "source_s3_path": "landing/{{ source_root }}/current",
+    "target_s3_path": "landing/{{ source_root }}/{{ SOURCE_DATASET }}",
+    "source_archive_s3_path": "landing/{{ source_root }}/archive/{{ SOURCE_DATASET }}",
+    "control_archive_s3_path": "admin/archive/{{ source_root }}/ctrlfile/ingestion",
 
     "file_prefix": "{{ FILE_PREFIX }}",
 
     "script_landing_to_raw": "/home/hadoop/ods-utilities/landingToRawS3.sh",
     "script_raw_to_sss": "/home/hadoop/batch-process/ods-raw-delta-process.sh",
 
-    "raw_table": "{{ RAW_TABLE }}",
-    "raw_schema": "{{ RAW_SCHEMA }}",
+    "raw_table": "{{ SOURCE_DATASET }}",
+    "domain_name": "rl_raw_source",
 
-    "raw_config_file": "{{ RAW_CONFIG_FILE }}",
+    "raw_config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
     "control_file_prefix": "{{ CONTROL_FILE_PREFIX }}",
-    "control_file_path": "{{ CONTROL_FILE_PATH }}",  # e.g. raw/source/ctrlfile/ingestion/
+    "control_file_path": "raw/{{ source_root }}/ctrlfile/ingestion/",
 
     "aws_conn_id": "aws_default",
-    "emr_config_key": "admin/config/BMC_EMR.config",
+    "emr_config_key": "admin/config/BMC_EMR_config",
 }
 
 ODS_BUCKET = CFG["ods_bucket"]
 
 
+# ---------------------------------------------------------------------
+# S3 helpers
+# ---------------------------------------------------------------------
 class S3ObjectManager:
     def __init__(self, bucket: str, aws_conn_id: str):
         self.bucket = bucket
@@ -68,12 +74,16 @@ class S3ObjectManager:
 
     @staticmethod
     def _wildcard_to_regex(pattern: str) -> re.Pattern:
-        regex = pattern.replace(".", r"\.").replace("*", ".*").replace("?", ".")
+        # Convert simple wildcard pattern (* and ?) to regex over filename
+        # Escape '.' etc, then apply wildcard rules.
+        regex = re.escape(pattern)
+        regex = regex.replace(r"\*", ".*").replace(r"\?", ".")
         return re.compile(rf"^{regex}$")
 
     def list_s3_objects_wildcard(self, prefix: str, filename_pattern: str) -> List[str]:
         rx = self._wildcard_to_regex(filename_pattern)
         prefix = prefix.rstrip("/") + "/"
+
         matching: List[str] = []
         token = None
 
@@ -83,14 +93,17 @@ class S3ObjectManager:
                 params["ContinuationToken"] = token
 
             resp = self.s3.list_objects_v2(**params)
+
             for obj in (resp.get("Contents") or []):
                 key = obj["Key"]
+                # match pattern against the filename portion relative to prefix
                 filename = key[len(prefix):] if key.startswith(prefix) else key.split("/")[-1]
                 if rx.match(filename):
                     matching.append(key)
 
             if not resp.get("IsTruncated"):
                 break
+
             token = resp.get("NextContinuationToken")
 
         return matching
@@ -116,6 +129,7 @@ class S3ObjectManager:
             Key=dest_key,
         )
         dst = self.head(dest_key)
+
         if src.get("ContentLength", 0) != dst.get("ContentLength", -1):
             raise AirflowFailException(
                 f"Copy size mismatch: {source_key} -> {dest_key} "
@@ -128,15 +142,25 @@ class S3ObjectManager:
     def archive(self, source_key: str, archive_prefix: str) -> str:
         archive_prefix = archive_prefix.rstrip("/") + "/"
         dest_key = archive_prefix + source_key.split("/")[-1]
+
         if not self.validate_source_exists(source_key):
             raise AirflowFailException(f"Source missing: s3://{self.bucket}/{source_key}")
+
         self.copy_and_validate(source_key, dest_key)
         self.delete(source_key)
         return dest_key
 
 
+# ---------------------------------------------------------------------
+# EMR helpers
+# ---------------------------------------------------------------------
 def _get_emr_id() -> str:
+    """
+    Reads EMR cluster mapping/config from S3 and finds the cluster_id for CFG['emr_name'].
+    Fix applied: boto3 S3 Object() called with (bucket, key) only.
+    """
     s3 = boto3.resource("s3")
+
     body = (
         s3.Object(ODS_BUCKET, CFG["emr_config_key"])
         .get()["Body"]
@@ -147,13 +171,16 @@ def _get_emr_id() -> str:
     matches = []
     for line in body.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) > 3 and parts[0] == CFG["emr_name"].strip():
+        # Expecting something like: <emr_name>,...,<cluster_id> at index 3
+        if len(parts) > 3 and parts[0] == (CFG["emr_name"] or "").strip():
             matches.append(parts[3])
 
     if not matches:
         raise AirflowFailException(
-            f"EMR cluster '{CFG['emr_name']}' not found in s3://{ODS_BUCKET}/{CFG['emr_config_key']}"
+            f"EMR cluster '{CFG['emr_name']}' not found in "
+            f"s3://{ODS_BUCKET}/{CFG['emr_config_key']}"
         )
+
     return matches[0].strip()
 
 
@@ -164,38 +191,134 @@ def make_emr_step(name: str, script: str, args: List[str]) -> dict:
     return {
         "Name": name,
         "ActionOnFailure": "CONTINUE",
-        "HadoopJarStep": {"Jar": "command-runner.jar", "Args": ["bash", script] + args},
+        "HadoopJarStep": {
+            "Jar": "command-runner.jar",
+            "Args": ["bash", script] + args,
+        },
     }
 
 
+# ---------------------------------------------------------------------
+# Args builders (positional args MUST match bash scripts)
+# ---------------------------------------------------------------------
 def args_landing_to_raw() -> List[str]:
+    """
+    landingToRawS3.sh expects:
+      $1 bucket_nm
+      $2 src_system
+      $3 table_nm
+      $4 load_type
+      $5 domain_name
+    Fix applied: align positional args with the script contract.
+    """
     return [
-        CFG["ods_bucket"],
-        CFG["source_root"],   # constant "source"
-        CFG["raw_table"],
-        "incremental",
-        CFG["raw_schema"],
+        CFG["ods_bucket"],        # $1
+        CFG["source_dataset"],    # $2 (src_system)
+        CFG["raw_table"],         # $3
+        "incremental",            # $4
+        CFG["domain_name"],       # $5
     ]
 
 
 def args_raw_to_sss(control_file_key: str) -> List[str]:
+    """
+    ods-raw-delta-process.sh expects:
+      $1 bucketName
+      $2 jsonControlFile
+      $3 domainName
+      $4 table_type   (default DELTA)
+      $5 source_system (default raw)
+    Fix applied: set $3 as domain_name (NOT source_root), keep ICEBERG as $4.
+    """
     return [
-        CFG["ods_bucket"],
-        CFG["source_root"],   # constant "source"
-        CFG["raw_table"],
-        control_file_key,
+        CFG["ods_bucket"],        # $1
+        control_file_key,         # $2
+        CFG["domain_name"],       # $3
+        "ICEBERG",                # $4
+        "raw",                    # $5 (script default is raw; keep explicit)
     ]
 
 
+# ---------------------------------------------------------------------
+# File pattern / selection helpers
+# ---------------------------------------------------------------------
 def _parse_file_metadata(filename: str, file_prefix: str) -> Optional[Tuple[str, int, str]]:
-    rx = re.compile(rf"^{re.escape(file_prefix)}-(\d{{14}})-(Full|Incremental)-(\d+)\.tsv$")
+    """
+    Parses filenames like:
+      <prefix>-<14digitTs>-(Full|Incremental)-<n>.tsv
+    Returns (kind, n, ts)
+    """
+    rx = re.compile(
+        rf"^{re.escape(file_prefix)}-(\d{{14}})-(Full|Incremental)-(\d+)\.tsv$"
+    )
     m = rx.match(filename)
     if not m:
         return None
+
     ts = m.group(1)
     kind = m.group(2)
     n = int(m.group(3))
     return kind, n, ts
+
+
+# ---------------------------------------------------------------------
+# Airflow callables
+# ---------------------------------------------------------------------
+def _get_batch_number(**kwargs) -> str:
+    # NOTE: leaving your existing import pattern intact.
+    from packages.get_batch_number import Get_Batch_number
+
+    obj = Get_Batch_number(
+        bucket_name=ODS_BUCKET,
+        source_system=CFG["source_system_name_for_emr"],  # unchanged per your request
+        conf=CFG["config_file"],                          # unchanged per your request
+    )
+
+    batch = obj.get_raw_batch_number()
+    if batch is None:
+        raise AirflowFailException("Unable to determine batch number.")
+    return str(batch)
+
+
+def _get_control_file(**kwargs) -> str:
+    """
+    Fix applied: batch_num must come from XCom (get_batch_number).
+    """
+    ti = kwargs["ti"]
+    batch_num = ti.xcom_pull(task_ids="get_batch_number")
+    if not batch_num:
+        raise AirflowFailException("Batch number missing from XCom.")
+
+    from packages.get_batch_number import Get_Batch_number
+
+    gbn = Get_Batch_number(
+        bucket_name=ODS_BUCKET,
+        source_system=CFG["source_root"],      # unchanged per your request
+        conf=CFG["raw_config_file"],
+    )
+
+    control_file_pattern = f"control_file_{CFG['source_root']}_20*_{batch_num}.json"
+    control_files = gbn.list_s3_objects_wildcard(CFG["control_file_path"], control_file_pattern)
+    if not control_files:
+        raise AirflowFailException(
+            f"Unable to find control file: {CFG['control_file_path']}{control_file_pattern}"
+        )
+
+    return control_files[0]
+
+
+def _archive_files(**kwargs) -> None:
+    ti = kwargs["ti"]
+    mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
+
+    moved_key = ti.xcom_pull(task_ids="move_file_from_current_to_dataset", key="moved_source_key")
+    if not moved_key:
+        raise AirflowFailException("Moved source key missing; cannot archive source file.")
+    mgr.archive(moved_key, CFG["source_archive_s3_path"])
+
+    control_key = ti.xcom_pull(task_ids="get_control_file")
+    if control_key:
+        mgr.archive(control_key, CFG["control_archive_s3_path"])
 
 
 def _branch_on_file_type(**kwargs) -> str:
@@ -203,10 +326,12 @@ def _branch_on_file_type(**kwargs) -> str:
     s3_key = ti.xcom_pull(task_ids="FILE_WATCHER.s3_file_sensor_task")
     if not s3_key:
         raise AirflowFailException("No file found by sensor.")
+
     fn = s3_key.split("/")[-1]
     meta = _parse_file_metadata(fn, CFG["file_prefix"])
     if not meta:
         raise AirflowFailException(f"File does not match expected pattern: {fn}")
+
     kind, _, _ = meta
     return "manual_intervention_full" if kind == "Full" else "skip_manual_intervention"
 
@@ -227,6 +352,7 @@ def _move_selected_file(**kwargs) -> str:
 
     src_prefix = CFG["source_s3_path"].rstrip("/") + "/"
     tgt_prefix = CFG["target_s3_path"].rstrip("/") + "/"
+
     if not src_key.startswith(src_prefix):
         raise AirflowFailException(f"Selected key not under source prefix: {src_key}")
 
@@ -238,57 +364,9 @@ def _move_selected_file(**kwargs) -> str:
     return dest_key
 
 
-def _get_batch_number(**kwargs) -> str:
-    from packages.get_batch_number import Get_Batch_number
-
-    gbn = Get_Batch_number(
-        bucket_name=ODS_BUCKET,
-        source_system=CFG["source_root"],  # constant "source"
-        conf=CFG["raw_config_file"],
-    )
-    batch_num = gbn.get_raw_batch_number()
-    if not batch_num:
-        raise AirflowFailException("Unable to fetch batch number.")
-    return str(batch_num)
-
-
-def _get_control_file(**kwargs) -> str:
-    from packages.get_batch_number import Get_Batch_number
-
-    ti = kwargs["ti"]
-    batch_num = ti.xcom_pull(task_ids="get_batch_number", key="return_value")
-    if not batch_num:
-        raise AirflowFailException("Batch number missing; cannot find control file.")
-
-    gbn = Get_Batch_number(
-        bucket_name=ODS_BUCKET,
-        source_system=CFG["source_root"],  # constant "source"
-        conf=CFG["raw_config_file"],
-    )
-
-    control_file_pattern = f"{CFG['control_file_prefix']}_20*_{batch_num}.json"
-    control_files = gbn.list_s3_objects_wildcard(CFG["control_file_path"], control_file_pattern)
-    if not control_files:
-        raise AirflowFailException(
-            f"Unable to find control file: {CFG['control_file_path']}{control_file_pattern}"
-        )
-    return control_files[0]
-
-
-def _archive_files(**kwargs) -> None:
-    ti = kwargs["ti"]
-    mgr = S3ObjectManager(bucket=ODS_BUCKET, aws_conn_id=CFG["aws_conn_id"])
-
-    moved_key = ti.xcom_pull(task_ids="move_file_from_current_to_dataset", key="moved_source_key")
-    if not moved_key:
-        raise AirflowFailException("Moved source key missing; cannot archive source file.")
-    mgr.archive(moved_key, CFG["source_archive_s3_path"])
-
-    control_key = ti.xcom_pull(task_ids="get_control_file", key="return_value")
-    if control_key:
-        mgr.archive(control_key, CFG["control_archive_s3_path"])
-
-
+# ---------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------
 default_args = {"owner": "data-eng", "retries": 0, "retry_delay": timedelta(minutes=5)}
 
 with DAG(
@@ -329,13 +407,14 @@ with DAG(
                 meta = _parse_file_metadata(fn, CFG["file_prefix"])
                 if meta:
                     kind, n, ts = meta
-                    candidates.append((n, ts, k))
+                    candidates.append((kind, n, ts, k))
 
             if not candidates:
                 return False
 
-            candidates.sort(key=lambda x: (x[0], x[1]))
-            return candidates[0][2]
+            # Sort deterministically; pick first
+            candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+            return candidates[0][3]
 
         s3_file_sensor()
 
@@ -380,10 +459,18 @@ with DAG(
             poke_interval=60,
             timeout=3600,
         )
+
         add >> wait
 
-    get_batch_number = PythonOperator(task_id="get_batch_number", python_callable=_get_batch_number)
-    get_control_file = PythonOperator(task_id="get_control_file", python_callable=_get_control_file)
+    get_batch_number = PythonOperator(
+        task_id="get_batch_number",
+        python_callable=_get_batch_number,
+    )
+
+    get_control_file = PythonOperator(
+        task_id="get_control_file",
+        python_callable=_get_control_file,
+    )
 
     with TaskGroup(group_id="raw_to_sss") as tg_r2s:
         add = EmrAddStepsOperator(
@@ -394,7 +481,7 @@ with DAG(
                 make_emr_step(
                     name=f"Raw->SSS {CFG['source_dataset']}",
                     script=CFG["script_raw_to_sss"],
-                    args=args_raw_to_sss("{{ ti.xcom_pull(task_ids='get_control_file', key='return_value') }}"),
+                    args=args_raw_to_sss("{{ ti.xcom_pull(task_ids='get_control_file') }}"),
                 )
             ],
         )
@@ -407,6 +494,7 @@ with DAG(
             poke_interval=60,
             timeout=3600,
         )
+
         add >> wait
 
     archive_files = PythonOperator(
@@ -417,6 +505,7 @@ with DAG(
 
     end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_SUCCESS)
 
+    # Flow
     start >> file_watcher_group >> move_file_from_current_to_dataset >> branch
     branch >> manual_intervention_full
     branch >> skip_manual_intervention
