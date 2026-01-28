@@ -1,3 +1,21 @@
+	•	start: dummy start marker.
+	•	FILE_WATCHER.s3_file_sensor_task: waits until a matching .tsv shows up in landing/.../current/.
+	•	move_file_from_current_to_dataset: copies that file to landing/.../<dataset>/ and deletes it from current/.
+	•	branch_on_load_type: checks filename; if it’s Full vs Incremental.
+	•	manual_intervention_full: fails on purpose for Full load so you can clean tables; then you Mark Success to continue.
+	•	skip_manual_intervention: no-op path for Incremental.
+	•	gate_done: continues after either path above is marked success.
+	•	landing_to_raw.add: submits the landing→raw EMR bash step.
+	•	landing_to_raw.wait: waits for that EMR step to finish.
+	•	get_batch_number: reads audit/log and pulls the latest batch number.
+	•	get_control_file: finds the control .json created by landing→raw for that batch.
+	•	raw_to_sss.add: submits the raw→SSS EMR bash step using the control file.
+	•	raw_to_sss.wait: waits for that EMR step to finish.
+	•	archive_files: moves the processed .tsv and the control .json to archive paths in S3.
+	•	end: dummy end marker (only after success).
+
+
+
 # example: code_collection_dim.yaml
 
 # DAG identity
