@@ -1,0 +1,156 @@
+{
+  "dag-imports": [
+    ""
+  ],
+  "dag-param": {
+    "start_dt": "datetime.datetime(2026,1,15)",
+    "dag_tags": "'LAKEHOUSE','SOURCE'",
+    "dag_id": "source_SOURCE_DATASET",
+    "schedule_time_in_minutes": "60",
+    "emr_name": "BATCH_EMR_IP"
+  },
+  "include-airflow-variables": [
+    {
+      "airflow-variable-name": "ODS_S3_BUCKET",
+      "variable-refrence-in-dag": "BUCKET_NAME"
+    }
+  ],
+  "tasks": [
+    {
+      "task-group-name": "MCP_FILE_WATCHER_SOURCE_DATASET",
+      "dependency-group-name": "",
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "s3_file_sensor",
+          "input-params-in-order": {
+            "s3_key": "landing/source/current/FILE_PREFIX*.tsv",
+            "bucket_name": "BUCKET_NAME"
+          }
+        }
+      ]
+    },
+    {
+      "task-group-name": "MCP_GET_FILE_SOURCE_DATASET_LANDING",
+      "dependency-group-name": [
+        "MCP_FILE_WATCHER_SOURCE_DATASET"
+      ],
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "get_s3_file",
+          "input-params-in-order": {
+            "source_system": "SOURCE_DATASET",
+            "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+            "bucket_name": "BUCKET_NAME",
+            "file_path": "landing/source/current/",
+            "file_pattern": "FILE_PREFIX*.tsv"
+          }
+        }
+      ]
+    },
+    {
+      "task-group-name": "MCP_SOURCE_DATASET_LANDING_TO_RAW",
+      "dependency-group-name": [
+        "MCP_GET_FILE_SOURCE_DATASET_LANDING"
+      ],
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "emr_execution",
+          "input-params-in-order": {
+            "params": "/home/hadoop/ods-utilities/landingToRawS3.sh BUCKET_NAME SOURCE_DATASET SOURCE_DATASET incremental rl_raw_source",
+            "id": "landing_to_raw",
+            "method": "landing_to_raw",
+            "pass_batch_number": "N",
+            "pass_control_file": "N"
+          }
+        }
+      ]
+    },
+    {
+      "task-group-name": "MCP_SOURCE_DATASET_GET_BATCH_NUMBER",
+      "dependency-group-name": [
+        "MCP_SOURCE_DATASET_LANDING_TO_RAW"
+      ],
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "raw_batch_number",
+          "input-params-in-order": {
+            "source_system": "SOURCE_DATASET",
+            "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+            "bucket_name": "BUCKET_NAME"
+          }
+        }
+      ]
+    },
+    {
+      "task-group-name": "MCP_SOURCE_DATASET_GET_CONTROL_FILE",
+      "dependency-group-name": [
+        "MCP_SOURCE_DATASET_GET_BATCH_NUMBER"
+      ],
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "raw_batch_control_file",
+          "input-params-in-order": {
+            "source_system": "SOURCE_DATASET",
+            "bucket_name": "BUCKET_NAME",
+            "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+            "file_prefix": "CONTROL_FILE_PREFIX",
+            "control_file_path": "raw/source/ctrlfile/ingestion/"
+          }
+        }
+      ]
+    },
+    {
+      "task-group-name": "MCP_SOURCE_DATASET_RAW_TO_SSS",
+      "dependency-group-name": [
+        "MCP_SOURCE_DATASET_GET_CONTROL_FILE"
+      ],
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "emr_execution-batch-raw",
+          "input-params-in-order": {
+            "source_system_name": "SOURCE_DATASET",
+            "file_system_name": "ICEBERG",
+            "resource_link_name": "rl_raw_source",
+            "id": "raw_to_sss",
+            "method": "raw_to_sss",
+            "pass_batch_number": "N",
+            "pass_control_file": "Y"
+          }
+        }
+      ]
+    },
+    {
+      "task-group-name": "MCP_SOURCE_DATASET_ARCHIVE",
+      "dependency-group-name": [
+        "MCP_SOURCE_DATASET_RAW_TO_SSS"
+      ],
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "archive_files",
+          "input-params-in-order": {
+            "bucket_name": "BUCKET_NAME",
+            "source_prefix": "landing/source/current/",
+            "target_prefix": "landing/source/SOURCE_DATASET/",
+            "source_archive_prefix": "landing/source/archive/SOURCE_DATASET/",
+            "control_archive_prefix": "admin/archive/source/ctrlfile/ingestion",
+            "file_pattern": "FILE_PREFIX*.tsv"
+          }
+        }
+      ]
+    }
+  ]
+}
