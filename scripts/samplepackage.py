@@ -266,3 +266,13 @@ def ${method}(**context):
 
     print(result["tsv_key"])
     return result["tsv_key"]
+    
+    
+
+
+This PR adds a new DAG JSON template for ingesting *.tsv.gz files using the existing task-template framework.
+The new JSON defines the task flow to watch landing/source/current/, select files in FIFO order using the timestamp in the filename, and handle multi-part files (-1, -2, …) in part order.
+The selected gzip file is moved to landing/source/<dataset>/ and uncompressed there into a .tsv for downstream processing.
+To support this, we added a new get_s3_file_unzip task template and new helper functions in packages to pick the next file and perform S3→S3 gunzip in a reliable streaming way.
+The new JSON reuses existing downstream task templates (EMR steps, control file handling, archive) without changing them.
+This keeps the change isolated while making the new dataset onboard consistent with the repo’s task-template pattern.
