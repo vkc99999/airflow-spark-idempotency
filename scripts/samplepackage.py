@@ -4,12 +4,13 @@ import gzip
 import hashlib
 from typing import Dict, List, Optional, Tuple
 
+import boto3
+
 
 class _GzipStreamingReader(io.RawIOBase):
     """
-    File-like object that streams uncompressed bytes from an S3 Body stream.
-    upload_fileobj() will pull from read() until EOF.
-    Also tracks bytes + sha256 while streaming.
+    Streams uncompressed bytes from an S3 Body stream.
+    Tracks bytes_out + sha256 of the uncompressed TSV.
     """
     def __init__(self, s3_body_stream):
         super().__init__()
@@ -29,14 +30,15 @@ class _GzipStreamingReader(io.RawIOBase):
 
 
 class S3_Object_Management:
-    # ... keep your existing __init__, archive_file, validate_copy, etc.
-
-    _TSV_GZ_RE = re.compile(
-        r"^(?P<prefix>.+)-(?P<ts>\d{14})-(?P<kind>Full|Incremental)-(?P<part>\d+)\.tsv\.gz$"
-    )
+    def __init__(self, bucket_name: str):
+        self.bucket = bucket_name
+        self.s3_client = boto3.client("s3")
 
     def _list_keys_under_prefix(self, prefix: str) -> List[str]:
-        prefix = prefix.lstrip("/")
+        prefix = (prefix or "").lstrip("/")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+
         keys: List[str] = []
         token = None
 
@@ -55,38 +57,67 @@ class S3_Object_Management:
 
         return keys
 
-    def _parse_gz_name(
-        self,
-        filename: str,
-        expected_file_prefix: str,
-    ) -> Optional[Tuple[str, int]]:
+    def _head(self, key: str) -> dict:
+        return self.s3_client.head_object(Bucket=self.bucket, Key=key)
+
+    def _copy_validate_delete(self, source_key: str, dest_key: str) -> None:
+        src = self._head(source_key)
+        self.s3_client.copy_object(
+            CopySource={"Bucket": self.bucket, "Key": source_key},
+            Bucket=self.bucket,
+            Key=dest_key,
+        )
+        dst = self._head(dest_key)
+
+        if int(src.get("ContentLength", -1)) != int(dst.get("ContentLength", -2)):
+            raise Exception(
+                f"Copy size mismatch: {source_key} -> {dest_key} "
+                f"(src={src.get('ContentLength')}, dst={dst.get('ContentLength')})"
+            )
+
+        self.s3_client.delete_object(Bucket=self.bucket, Key=source_key)
+
+    def _parse_ts_part(self, filename: str, file_prefix: str) -> Optional[Tuple[str, int]]:
         """
-        Returns (ts, part) if filename matches expected prefix and pattern.
+        Accepts: <prefix>-<14digitTs>-<anything>-<part>.tsv.gz
+        Example: PricerDimension-20251205140420-Incremental-2.tsv.gz
+        Returns: (ts, part)
         """
-        m = self._TSV_GZ_RE.match(filename)
+        rx = re.compile(
+            rf"^{re.escape(file_prefix)}-(\d{{14}})-[^-]+-(\d+)\.tsv\.gz$"
+        )
+        m = rx.match(filename)
         if not m:
             return None
-        if m.group("prefix") != expected_file_prefix:
-            return None
-        ts = m.group("ts")
-        part = int(m.group("part"))
+        ts = m.group(1)
+        part = int(m.group(2))
         return ts, part
 
-    def _pick_next_fifo_gz_key(
+    def move_gz_to_dataset_and_unzip_oldest_first(
         self,
         source_location: str,
+        target_location: str,
         file_prefix: str,
-    ) -> Optional[str]:
+        delete_gz_after_unzip: bool = True,
+    ) -> Dict[str, str]:
         """
-        FIFO pick:
-          - oldest timestamp first
-          - within same timestamp, smallest part number
-          - do not process part>1 unless part1 exists for that timestamp
-        Returns the S3 key to process next, or None if nothing eligible yet.
+        Oldest timestamp first.
+        If multiple files share same timestamp => smallest part wins.
+        If part-1 is missing, we STILL allow picking part-2/5/etc (as requested).
+
+        Flow:
+          - pick next gz from source_location
+          - copy to target_location (same filename) + validate + delete from source
+          - unzip in target_location to .tsv (streaming)
+          - validate TSV size == streamed bytes
+          - optionally delete the gz in target
         """
-        src_prefix = source_location.strip("/")
-        if not src_prefix.endswith("/"):
+        src_prefix = (source_location or "").strip("/")
+        tgt_prefix = (target_location or "").strip("/")
+        if src_prefix and not src_prefix.endswith("/"):
             src_prefix += "/"
+        if tgt_prefix and not tgt_prefix.endswith("/"):
+            tgt_prefix += "/"
 
         all_keys = self._list_keys_under_prefix(src_prefix)
 
@@ -95,120 +126,96 @@ class S3_Object_Management:
             fn = k.split("/")[-1]
             if not fn.endswith(".tsv.gz"):
                 continue
-            meta = self._parse_gz_name(fn, file_prefix)
+            meta = self._parse_ts_part(fn, file_prefix)
             if not meta:
                 continue
             ts, part = meta
             candidates.append((ts, part, k))
 
         if not candidates:
-            return None
-
-        # Find oldest timestamp present
-        oldest_ts = min(t[0] for t in candidates)
-
-        # Consider only files from oldest timestamp
-        oldest = [(ts, part, k) for (ts, part, k) in candidates if ts == oldest_ts]
-        parts_present = {part for (_, part, _) in oldest}
-
-        # Gate: part 1 must exist
-        if 1 not in parts_present:
-            return None
-
-        # Pick the smallest available part (1, then 2, then 3...)
-        ts, part, key = sorted(oldest, key=lambda x: x[1])[0]
-        return key
-
-    def move_gz_to_dataset_and_unzip_fifo(
-        self,
-        source_location: str,
-        target_location: str,
-        file_prefix: str,
-        delete_gz_after_unzip: bool = True,
-    ) -> Dict[str, str]:
-        """
-        Picks next gz (FIFO), copies it to target_location, unzips to .tsv in target_location.
-        Returns {"gz_key": ..., "tsv_key": ..., "sha256": ..., "bytes": "..."}
-        """
-        next_src_key = self._pick_next_fifo_gz_key(source_location, file_prefix)
-        if not next_src_key:
             raise Exception(
-                f"No eligible .tsv.gz found yet under {source_location} for prefix={file_prefix} "
-                f"(waiting for part-1 or files)."
+                f"No matching .tsv.gz files under s3://{self.bucket}/{src_prefix} "
+                f"for prefix={file_prefix}"
             )
 
-        filename_gz = next_src_key.split("/")[-1]
-        if not filename_gz.endswith(".gz"):
-            raise Exception(f"Unexpected file (not .gz): {filename_gz}")
+        # Pick oldest timestamp, then smallest part
+        oldest_ts = min(ts for (ts, _, _) in candidates)
+        group = [(part, key) for (ts, part, key) in candidates if ts == oldest_ts]
+        part, selected_src_key = min(group, key=lambda x: x[0])
 
-        # 1) Copy gz from current -> dataset landing (and delete from current)
-        # Reuse your existing validated copy+delete logic.
-        gz_key_in_dataset = self.archive_file(next_src_key, target_location)
+        filename_gz = selected_src_key.split("/")[-1]
+        dest_gz_key = f"{tgt_prefix}{filename_gz}"
 
-        # 2) Unzip gz (in dataset) -> tsv (same folder)
-        tsv_key_in_dataset = gz_key_in_dataset[:-3]  # drop ".gz"
+        # Move gz: current -> dataset (copy+validate+delete)
+        self._copy_validate_delete(selected_src_key, dest_gz_key)
 
-        # If TSV already exists (retry case), skip unzip and just clean gz if needed
+        # Unzip gz in dataset -> tsv in dataset
+        dest_tsv_key = dest_gz_key[:-3]  # drop ".gz"
+
+        # If TSV already exists (retry scenario), skip unzip and just optionally delete gz
         try:
-            head_tsv = self.s3_client.head_object(Bucket=self.bucket, Key=tsv_key_in_dataset)
-            if head_tsv.get("ContentLength", 0) > 0:
+            head_tsv = self._head(dest_tsv_key)
+            if int(head_tsv.get("ContentLength", 0)) > 0:
                 if delete_gz_after_unzip:
-                    self.s3_client.delete_object(Bucket=self.bucket, Key=gz_key_in_dataset)
+                    self.s3_client.delete_object(Bucket=self.bucket, Key=dest_gz_key)
                 return {
-                    "gz_key": gz_key_in_dataset,
-                    "tsv_key": tsv_key_in_dataset,
-                    "sha256": "",
+                    "selected_src_key": selected_src_key,
+                    "gz_key": dest_gz_key,
+                    "tsv_key": dest_tsv_key,
                     "bytes": str(head_tsv.get("ContentLength", 0)),
+                    "sha256": "",
                 }
         except Exception:
             pass
 
-        resp = self.s3_client.get_object(Bucket=self.bucket, Key=gz_key_in_dataset)
-        body_stream = resp["Body"]
+        resp = self.s3_client.get_object(Bucket=self.bucket, Key=dest_gz_key)
+        reader = _GzipStreamingReader(resp["Body"])
 
-        reader = _GzipStreamingReader(body_stream)
+        # Slow but reliable streaming upload
+        self.s3_client.upload_fileobj(reader, self.bucket, dest_tsv_key)
 
-        # upload_fileobj streams and is slower but reliable (multipart when needed)
-        self.s3_client.upload_fileobj(reader, self.bucket, tsv_key_in_dataset)
-
-        # 3) Validate unzip upload: compare TSV ContentLength to bytes we streamed
-        head = self.s3_client.head_object(Bucket=self.bucket, Key=tsv_key_in_dataset)
+        # Validate TSV upload size matches streamed bytes
+        head = self._head(dest_tsv_key)
         dest_len = int(head.get("ContentLength", 0))
-        if dest_len != reader.bytes_out:
+        if dest_len != int(reader.bytes_out):
             raise Exception(
-                f"Unzip size mismatch for {tsv_key_in_dataset}: "
-                f"uploaded={dest_len}, streamed={reader.bytes_out}"
+                f"Unzip size mismatch for {dest_tsv_key}: uploaded={dest_len}, streamed={reader.bytes_out}"
             )
 
         if delete_gz_after_unzip:
-            self.s3_client.delete_object(Bucket=self.bucket, Key=gz_key_in_dataset)
+            self.s3_client.delete_object(Bucket=self.bucket, Key=dest_gz_key)
 
         return {
-            "gz_key": gz_key_in_dataset,
-            "tsv_key": tsv_key_in_dataset,
-            "sha256": reader.sha256.hexdigest(),
+            "selected_src_key": selected_src_key,
+            "gz_key": dest_gz_key,
+            "tsv_key": dest_tsv_key,
             "bytes": str(reader.bytes_out),
+            "sha256": reader.sha256.hexdigest(),
         }
-        
-        
-        
-@task(task_id="copy_unzip_to_dataset_landing")
+
+
+
+
+
+from airflow.decorators import task
+
+@task(task_id="COPY_UNZIP_TO_DATASET_LANDING")
 def ${method}(**context):
     from packages.get_batch_number import S3_Object_Management
 
     mgr = S3_Object_Management(${bucket_name})
 
-    result = mgr.move_gz_to_dataset_and_unzip_fifo(
+    result = mgr.move_gz_to_dataset_and_unzip_oldest_first(
         source_location="${source_location}",
         target_location="${target_location}",
         file_prefix="${file_prefix}",
         delete_gz_after_unzip=True,
     )
 
-    print(f"Selected gz: {result['gz_key']}")
-    print(f"Created tsv:  {result['tsv_key']}")
-    print(f"Bytes:       {result['bytes']}")
-    print(f"SHA256:      {result['sha256']}")
+    # Keep logs short
+    print(f"Picked: {result['selected_src_key']}")
+    print(f"TSV:    {result['tsv_key']}")
+    print(f"Bytes:  {result['bytes']}")
 
-    # Return TSV key so downstream tasks can use it if needed
+    # returning TSV key is useful if any downstream wants it
     return result["tsv_key"]
