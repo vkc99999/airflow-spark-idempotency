@@ -1,25 +1,10 @@
-def _parse_ts_type_part(
-    self,
-    filename: str,
-    file_prefix: str,
-) -> Optional[Tuple[str, str, int]]:
-    """Parse '<prefix>-<14ts>-<Full|Incremental>-<part>.tsv.gz' -> (ts, type, part)."""
-    rx = re.compile(
-        rf"^{re.escape(file_prefix)}-(\d{{14}})-(Full|Incremental)-(\d+)\.tsv\.gz$"
-    )
-    m = rx.match(filename)
-    if not m:
-        return None
-    return m.group(1), m.group(2), int(m.group(3))
-
-
 def _pick_oldest_ts_prefer_full_then_smallest_part(
     self,
     keys: List[str],
     file_prefix: str,
 ) -> str:
-    """Pick oldest ts; within ts prefer Full; then smallest part."""
-    candidates: List[Tuple[str, int, int, str]] = []
+    """Oldest timestamp date; prefer Full on that date; else oldest ts; always smallest part."""
+    candidates: List[Tuple[str, str, int, str]] = []
 
     for k in keys:
         fn = k.split("/")[-1]
@@ -31,11 +16,20 @@ def _pick_oldest_ts_prefer_full_then_smallest_part(
             continue
 
         ts, ftype, part = meta
-        type_rank = 0 if ftype == "Full" else 1
-        candidates.append((ts, type_rank, part, k))
+        candidates.append((ts, ftype, part, k))
 
     if not candidates:
         raise Exception(f"No matching .tsv.gz keys for prefix={file_prefix}")
 
-    candidates.sort()
-    return candidates[0][3]
+    oldest_ts = min(ts for (ts, _, _, _) in candidates)
+    oldest_date = oldest_ts[:8]
+
+    same_date = [c for c in candidates if c[0].startswith(oldest_date)]
+    fulls = [c for c in same_date if c[1] == "Full"]
+
+    if fulls:
+        _, _, _, selected = min(fulls, key=lambda x: (x[0], x[2]))
+        return selected
+
+    _, _, _, selected = min(candidates, key=lambda x: (x[0], x[2]))
+    return selected
