@@ -1,0 +1,68 @@
+from airflow.decorators import task
+from airflow.utils.email import send_email
+from airflow.utils.state import State
+import os
+
+
+def _split_emails(raw: str):
+    return [e.strip() for e in (raw or "").split(",") if e.strip()]
+
+
+@task(task_id="notify_failure_email", trigger_rule="one_failed")
+def ${method}(**context):
+    """Send a single email if any task fails in this DAG run."""
+    env = (os.getenv("sdlc_env") or os.getenv("SDLC_ENV") or "").strip().upper()
+
+    if env == "PROD":
+        to = _split_emails("${emails_prod}")
+    elif env in ("ST", "STAGE", "STAGING"):
+        to = _split_emails("${emails_st}")
+    else:
+        to = _split_emails("${emails_dev}")
+
+    if not to:
+        print(f"No alert recipients configured for env={env}")
+        return
+
+    dag_id = context["dag"].dag_id
+    run_id = context["dag_run"].run_id
+
+    tis = context["dag_run"].get_task_instances()
+    failed = [ti for ti in tis if ti.state == State.FAILED]
+
+    items = ""
+    for ti in failed:
+        items += f"<li><b>{ti.task_id}</b> — <a href='{ti.log_url}'>log</a></li>"
+
+    subject = f"[{env or 'UNKNOWN'}] Airflow DAG failed: {dag_id}"
+    html = (
+        f"<p><b>DAG:</b> {dag_id}</p>"
+        f"<p><b>Run:</b> {run_id}</p>"
+        f"<p><b>Failed tasks:</b></p><ul>{items}</ul>"
+    )
+
+    send_email(to=to, subject=subject, html_content=html)
+
+
+
+{
+  "task-group-name": "NOTIFY_FAILURE",
+  "dependency-group-name": [
+    "FILE_WATCHER_SOURCE",
+    "GET_FILE_SOURCE_DATASET_LANDING",
+    "LANDING_TO_RAW"
+    // add every other task-group in this DAG here
+  ],
+  "type": "TASK",
+  "task-object-type": "method",
+  "task-details": [
+    {
+      "task-template-name": "notify_failure_email",
+      "input-params-in-order": {
+        "emails_dev": "dev1@x.com,dev2@x.com",
+        "emails_st": "st1@x.com",
+        "emails_prod": "prod1@x.com,prod2@x.com"
+      }
+    }
+  ]
+}
