@@ -1,340 +1,1290 @@
-{
-  "dag-imports": [""],
-  "dag-param": {
-    "start_dt": "datetime.datetime(2026,1,15)",
-    "dag_tags": "'LAKEHOUSE','IM-CLINICAL','FILE-SOURCE'",
-    "dag_id": "SOURCE_CODE_COLLECTION_DIM",
-    "schedule_time_in_minutes": "60",
-    "emr_name": "BATCH_EMR_IP"
+[
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_COMPOSITE_SERVICE_CATEGORY_DIM",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
+    },
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/CompositeServiceCategoryDimension*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/composite_service_category_dim/",
+              "file_prefix": "CompositeServiceCategoryDimension"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "composite_service_category_dim",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
   },
-  "include-airflow-variables": [
-    {
-      "airflow-variable-name": "ODS_S3_BUCKET",
-      "variable-refrence-in-dag": "BUCKET_NAME"
-    }
-  ],
-  "tasks": [
-    {
-      "task-group-name": "FILE_WATCHER_SOURCE",
-      "dependency-group-name": "",
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "s3_file_sensor",
-          "input-params-in-order": {
-            "s3_key": "landing/source/current/CodeCollectionDimension*.tsv*",
-            "bucket_name": "BUCKET_NAME",
-            "poke_interval": 60,
-            "timeout": 3600
-          }
-        }
-      ]
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_CONFIGURATION_FACT",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
     },
-    {
-      "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
-      "dependency-group-name": ["FILE_WATCHER_SOURCE"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "get_s3_file_unzip",
-          "input-params-in-order": {
-            "bucket_name": "BUCKET_NAME",
-            "sensor_task_id": "s3_file_sensor_task",
-            "target_location": "landing/source/code_collection_dim/",
-            "unzip_mode": "AUTO"
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/ConfigurationFact*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
           }
-        }
-      ]
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/configuration_fact/",
+              "file_prefix": "ConfigurationFact"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "configuration_fact",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_CROSS_WALK_DIM",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
     },
-    {
-      "task-group-name": "LANDING_TO_RAW",
-      "dependency-group-name": ["GET_FILE_SOURCE_DATASET_LANDING"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "emr_execution",
-          "input-params-in-order": {
-            "params": "/home/hadoop/ods-utilities/landingToRawS3.sh BUCKET_NAME CODE_COLLECTION_DIM",
-            "id": "landing_to_raw",
-            "method": "landing_to_raw",
-            "pass_batch_number": "N",
-            "pass_control_file": "N"
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/CrossWalkDimension*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
           }
-        }
-      ]
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/cross_walk_dim/",
+              "file_prefix": "CrossWalkDimension"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "cross_walk_dim",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_FEE_TABLE",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
     },
-    {
-      "task-group-name": "GET_BATCH_NUMBER",
-      "dependency-group-name": ["LANDING_TO_RAW"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "raw_batch_number",
-          "input-params-in-order": {
-            "source_system": "CODE_COLLECTION_DIM",
-            "config_file": "admin/domains/lakehouse/raw/code_collection_dim/config/ods.config",
-            "bucket_name": "BUCKET_NAME"
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/FeeTable*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
           }
-        }
-      ]
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/fee_table/",
+              "file_prefix": "FeeTable"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "fee_table",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_PRICER_DIM",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
     },
-    {
-      "task-group-name": "GET_CONTROL_FILE",
-      "dependency-group-name": ["GET_BATCH_NUMBER"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "raw_batch_control_file",
-          "input-params-in-order": {
-            "source_system": "CODE_COLLECTION_DIM",
-            "bucket_name": "BUCKET_NAME",
-            "config_file": "admin/domains/lakehouse/raw/code_collection_dim/config/ods.config",
-            "file_prefix": "code_collection_dim",
-            "control_file_path": "raw/source/ctrlfile/ingestion/"
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/PricerDimension*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
           }
-        }
-      ]
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/pricer_dim/",
+              "file_prefix": "PricerDimension"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "pricer_dim",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_PRICER_PARAMETER_DIM",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
     },
-    {
-      "task-group-name": "RAW_TO_SSS",
-      "dependency-group-name": ["GET_CONTROL_FILE"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "emr_execution",
-          "input-params-in-order": {
-            "params": "/home/hadoop/ods-utilities/rawToSss.sh BUCKET_NAME CODE_COLLECTION_DIM",
-            "id": "raw_to_sss",
-            "method": "raw_to_sss",
-            "pass_batch_number": "Y",
-            "pass_control_file": "Y"
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/PricerParameterDimension*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
           }
-        }
-      ]
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/pricer_parameter_dim/",
+              "file_prefix": "PricerParameterDimension"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "pricer_parameter_dim",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "dag-imports": [
+      ""
+    ],
+    "dag-param": {
+      "start_dt": "datetime.datetime(2026,1,15)",
+      "dag_tags": "'LAKEHOUSE','IM-Clinical','FILE-SOURCE'",
+      "dag_id": "SOURCE_SERVICE_DEFINITION",
+      "schedule_time_in_minutes": "60",
+      "emr_name": "CUSTOMER_LAKE_EMR_IP"
     },
-    {
-      "task-group-name": "ARCHIVE_SOURCE_FILE",
-      "dependency-group-name": ["RAW_TO_SSS"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "archive_s3_source_file",
-          "input-params-in-order": {
-            "bucket_name": "BUCKET_NAME",
-            "target_location": "landing/source/archive/code_collection_dim/"
+    "include-airflow-variables": [
+      {
+        "airflow-variable-name": "ODS_S3_BUCKET",
+        "variable-refrence-in-dag": "BUCKET_NAME"
+      }
+    ],
+    "tasks": [
+      {
+        "task-group-name": "FILE_WATCHER_SOURCE",
+        "dependency-group-name": "",
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "s3_file_sensor",
+            "input-params-in-order": {
+              "s3_key": "landing/source/current/ServiceDefinition*.tsv*",
+              "bucket_name": "BUCKET_NAME",
+              "poke_interval": 60,
+              "timeout": 3600
+            }
           }
-        }
-      ]
-    },
-    {
-      "task-group-name": "ARCHIVE_CONTROL_FILE",
-      "dependency-group-name": ["ARCHIVE_SOURCE_FILE"],
-      "type": "TASK",
-      "task-object-type": "method",
-      "task-details": [
-        {
-          "task-template-name": "archive_s3_control_file",
-          "input-params-in-order": {
-            "bucket_name": "BUCKET_NAME",
-            "target_location": "raw/source/ctrlfile/archive/"
+        ]
+      },
+      {
+        "task-group-name": "GET_FILE_SOURCE_DATASET_LANDING",
+        "dependency-group-name": [
+          "FILE_WATCHER_SOURCE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "get_s3_file_unzip",
+            "input-params-in-order": {
+              "method": "get_s3_file_unzip",
+              "bucket_name": "BUCKET_NAME",
+              "source_location": "landing/source/current/",
+              "target_location": "landing/source/service_definition/",
+              "file_prefix": "ServiceDefinition"
+            }
           }
-        }
-      ]
-    }
-  ]
-}
-
-
-
-    
-@task(task_id="copy_unzip_to_dataset_landing")
-def ${method}(**context):
-
-    # MUST match the upstream sensor task_id that returns the found .gz key.
-    # If your sensor task_id is different, change it here.
-    source_gz_key = "{{ task_instance.xcom_pull(task_ids='s3_file_sensor_task', key='return_value') }}"
-
-    target_prefix = "${target_location}"
-    print(f"source_gz_key  : {str(source_gz_key)}")
-    print(f"target_prefix  : {str(target_prefix)}")
-
-    from packages.get_batch_number import S3_Object_Management
-
-    return S3_Object_Management(${bucket_name}).move_gz_to_dataset_and_unzip(
-        source_key=source_gz_key,
-        target_prefix=target_prefix,
-        delete_dataset_gz="Y"
-    )
-
-
-class S3_Object_Management:
-    # ... your existing code ...
-
-    def _multipart_upload_bytes(
-        self,
-        destination_key: str,
-        byte_iter,
-        content_type: str = "text/tab-separated-values",
-        chunk_size: int = 8 * 1024 * 1024,  # 8MB (>= 5MB for multipart parts)
-    ) -> Dict:
-        """
-        Streams bytes into S3 using multipart upload.
-        Returns: {"bytes_written": int, "sha256": str}
-        """
-        upload_id = None
-        parts: List[Dict] = []
-        bytes_written = 0
-        sha256 = hashlib.sha256()
-
-        try:
-            resp = self.s3_client.create_multipart_upload(
-                Bucket=self.bucket,
-                Key=destination_key,
-                ContentType=content_type,
-            )
-            upload_id = resp["UploadId"]
-
-            part_number = 1
-            while True:
-                chunk = next(byte_iter, None)
-                if chunk is None:
-                    break
-
-                if not chunk:
-                    continue
-
-                sha256.update(chunk)
-                bytes_written += len(chunk)
-
-                up = self.s3_client.upload_part(
-                    Bucket=self.bucket,
-                    Key=destination_key,
-                    PartNumber=part_number,
-                    UploadId=upload_id,
-                    Body=chunk,
-                )
-                parts.append({"ETag": up["ETag"], "PartNumber": part_number})
-                part_number += 1
-
-            if not parts:
-                raise Exception("No data produced during gunzip (empty output)")
-
-            self.s3_client.complete_multipart_upload(
-                Bucket=self.bucket,
-                Key=destination_key,
-                UploadId=upload_id,
-                MultipartUpload={"Parts": parts},
-            )
-
-            return {"bytes_written": bytes_written, "sha256": sha256.hexdigest()}
-
-        except Exception:
-            if upload_id:
-                try:
-                    self.s3_client.abort_multipart_upload(
-                        Bucket=self.bucket,
-                        Key=destination_key,
-                        UploadId=upload_id,
-                    )
-                except Exception:
-                    pass
-            raise
-
-    def move_gz_to_dataset_and_unzip(
-        self,
-        source_key: str,
-        target_prefix: str,
-        delete_dataset_gz: str = "Y",
-    ) -> str:
-        """
-        Copies source .gz into target_prefix, gunzips to .tsv in target_prefix,
-        validates gunzip via gzip CRC + output ContentLength, then deletes dataset .gz (optional).
-
-        Returns: destination .tsv key (the unzipped key)
-        """
-        if not source_key or not target_prefix:
-            raise Exception("source_key and target_prefix are required")
-
-        # Normalize prefix
-        if not target_prefix.endswith("/"):
-            target_prefix = target_prefix + "/"
-
-        base_name = source_key.split("/")[-1]
-        if not base_name.endswith(".gz"):
-            raise Exception(f"Expected .gz file but got: {base_name}")
-
-        dataset_gz_key = target_prefix + base_name
-        dataset_tsv_key = target_prefix + base_name[:-3]  # drop ".gz"
-
-        print(f"Source gz           : {source_key}")
-        print(f"Dataset gz copy     : {dataset_gz_key}")
-        print(f"Dataset tsv (output): {dataset_tsv_key}")
-
-        # 1) Copy gz -> dataset prefix (DON'T delete source yet; safer)
-        copy_source = {"Bucket": self.bucket, "Key": source_key}
-        self.s3_client.copy_object(
-            CopySource=copy_source,
-            Bucket=self.bucket,
-            Key=dataset_gz_key,
-        )
-
-        # Validate copy of gz using your existing logic (size + ETag)
-        validate_copy = self.validate_copy(source_key, dataset_gz_key)
-        if validate_copy is None:
-            raise Exception("GZ copy validation failed (size/etag mismatch)")
-
-        # 2) Stream gunzip dataset_gz_key -> dataset_tsv_key
-        #    gzip module validates CRC when it reaches EOF.
-        obj = self.s3_client.get_object(Bucket=self.bucket, Key=dataset_gz_key)
-        body = obj["Body"]
-
-        def decompressed_chunks():
-            gz = gzip.GzipFile(fileobj=body)
-            try:
-                while True:
-                    chunk = gz.read(8 * 1024 * 1024)  # 8MB decompressed chunks
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                # closing verifies CRC/trailer
-                gz.close()
-                body.close()
-
-        upload_result = self._multipart_upload_bytes(
-            destination_key=dataset_tsv_key,
-            byte_iter=iter(decompressed_chunks()),
-            content_type="text/tab-separated-values",
-        )
-
-        # 3) Validate output size == bytes written
-        out_head = self.s3_client.head_object(Bucket=self.bucket, Key=dataset_tsv_key)
-        out_size = out_head.get("ContentLength", 0)
-        if out_size != upload_result["bytes_written"]:
-            raise Exception(
-                f"Unzip validation failed: "
-                f"bytes_written={upload_result['bytes_written']} "
-                f"but S3 ContentLength={out_size}"
-            )
-
-        print(f"Unzip OK. Output bytes={out_size}, sha256={upload_result['sha256']}")
-
-        # 4) Now that we have a valid .tsv, delete original source gz
-        #    (prevents reprocessing in /current/)
-        self.s3_client.delete_object(Bucket=self.bucket, Key=source_key)
-        print(f"Deleted source gz: {source_key}")
-
-        # 5) Optionally delete the dataset gz copy (since .tsv is the real input)
-        if str(delete_dataset_gz).upper() == "Y":
-            self.s3_client.delete_object(Bucket=self.bucket, Key=dataset_gz_key)
-            print(f"Deleted dataset gz copy: {dataset_gz_key}")
-
-        return dataset_tsv_key
-
+        ]
+      },
+      {
+        "task-group-name": "LANDING_TO_RAW",
+        "dependency-group-name": [
+          "GET_FILE_SOURCE_DATASET_LANDING"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution",
+            "input-params-in-order": {
+              "params": [
+                "/home/hadoop/ods-utilities/landingToRawS3.sh",
+                "BUCKET_NAME",
+                "source",
+                "service_definition",
+                "incremental",
+                "r1_raw_source"
+              ],
+              "id": "landing_to_raw",
+              "method": "landing_to_raw",
+              "pass_batch_number": "N",
+              "pass_control_file": "N"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_BATCH_NUMBER",
+        "dependency-group-name": [
+          "LANDING_TO_RAW"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_number",
+            "input-params-in-order": {
+              "method": "raw_batch_number",
+              "source_system": "source",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "bucket_name": "BUCKET_NAME"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "GET_CONTROL_FILE",
+        "dependency-group-name": [
+          "GET_BATCH_NUMBER"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "raw_batch_control_file",
+            "input-params-in-order": {
+              "method": "raw_batch_control_file",
+              "source_system": "source",
+              "bucket_name": "BUCKET_NAME",
+              "config_file": "admin/domains/lakehouse/raw/SOURCE/config/ods.config",
+              "file_prefix": "control_file_source",
+              "control_file_path": "raw/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "RAW_TO_SSS",
+        "dependency-group-name": [
+          "GET_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "emr-execution-batch-raw",
+            "input-params-in-order": {
+              "source_system_name": "source",
+              "file_system_name": "ICEBERG",
+              "resource_link_name": "r1_raw_source",
+              "id": "raw_to_sss",
+              "method": "raw_to_sss",
+              "pass_batch_number": "Y",
+              "pass_control_file": "Y"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "ARCHIVE_CONTROL_FILE",
+        "dependency-group-name": [
+          "RAW_TO_SSS"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "archive_s3_control_file",
+            "input-params-in-order": {
+              "method": "archive_control_file",
+              "bucket_name": "BUCKET_NAME",
+              "target_location": "admin/archive/source/ctrlfile/ingestion/"
+            }
+          }
+        ]
+      },
+      {
+        "task-group-name": "NOTIFY_FAILURE",
+        "dependency-group-name": [
+          "ARCHIVE_CONTROL_FILE"
+        ],
+        "type": "TASK",
+        "task-object-type": "method",
+        "task-details": [
+          {
+            "task-template-name": "send_failure_email",
+            "input-params-in-order": {
+              "emails_prod": "#IMPRODSUPPORT@healthfirst.org",
+              "emails_st": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_rt": "IM-Clinical_Auths_Labs@healthfirst.org",
+              "emails_dev": "",
+              "method": "send_failure_email"
+            }
+          }
+        ]
+      }
+    ]
+  }
+]
