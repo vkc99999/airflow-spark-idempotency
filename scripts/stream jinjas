@@ -1,0 +1,137 @@
+{
+  "dag-imports": [""],
+  "dag-param": {
+    "start_dt": "datetime.datetime(2026,1,15)",
+    "dag_tags": "'LAKEHOUSE','IM-Clinical','RESTART-STREAM'",
+    "dag_id": "MHS_PROV_CLAIMS_LAKE_GROUP_SSS",
+    "schedule_time_in_minutes": "None",
+    "emr_name": "CUSTOMER_LAKE_EMR_IP"
+  },
+  "include-airflow-variables": [],
+  "tasks": [
+    {
+      "task-group-name": "RESTART_STREAM_JOBS",
+      "dependency-group-name": "",
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "emr-execution",
+          "input-params-in-order": {
+            "params": "'/home/hadoop/stream-raw/restart_stream_jobs.sh', 'sss_lake', 'MHS_PROV_CLAIMS_LAKE_GROUP'",
+            "id": "restart_stream_jobs",
+            "method": "restart_stream_jobs",
+            "pass_batch_number": "N",
+            "pass_control_file": "N"
+          }
+        }
+      ]
+    }
+  ]
+}
+
+
+
+
+
+{
+  "dag-imports": [""],
+  "dag-param": {
+    "start_dt": "datetime.datetime(2026,1,15)",
+    "dag_tags": "'LAKEHOUSE','IM-Clinical','RESTART-STREAM'",
+    "dag_id": "MHS_PROV_MISC_LAKE_GROUP_SSS",
+    "schedule_time_in_minutes": "None",
+    "emr_name": "CUSTOMER_LAKE_EMR_IP"
+  },
+  "include-airflow-variables": [],
+  "tasks": [
+    {
+      "task-group-name": "RESTART_STREAM_JOBS",
+      "dependency-group-name": "",
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "emr-execution",
+          "input-params-in-order": {
+            "params": "'/home/hadoop/stream-raw/restart_stream_jobs.sh', 'sss_lake', 'MHS_PROV_MISC_LAKE_GROUP'",
+            "id": "restart_stream_jobs",
+            "method": "restart_stream_jobs",
+            "pass_batch_number": "N",
+            "pass_control_file": "N"
+          }
+        }
+      ]
+    }
+  ]
+}
+
+
+
+
+
+{
+  "dag-imports": [""],
+  "dag-param": {
+    "start_dt": "datetime.datetime(2026,1,15)",
+    "dag_tags": "'LAKEHOUSE','IM-Clinical','RESTART-STREAM'",
+    "dag_id": "MHS_PROV_CLAIMS_LAKE_GROUP_1_SSS",
+    "schedule_time_in_minutes": "None",
+    "emr_name": "CUSTOMER_LAKE_EMR_IP"
+  },
+  "include-airflow-variables": [],
+  "tasks": [
+    {
+      "task-group-name": "RESTART_STREAM_JOBS",
+      "dependency-group-name": "",
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "emr-execution",
+          "input-params-in-order": {
+            "params": "'/home/hadoop/stream-raw/restart_stream_jobs.sh', 'sss_lake', 'MHS_PROV_CLAIMS_LAKE_GROUP_1'",
+            "id": "restart_stream_jobs",
+            "method": "restart_stream_jobs",
+            "pass_batch_number": "N",
+            "pass_control_file": "N"
+          }
+        }
+      ]
+    }
+  ]
+}
+
+
+
+{
+  "dag-imports": [""],
+  "dag-param": {
+    "start_dt": "datetime.datetime(2026,1,15)",
+    "dag_tags": "'LAKEHOUSE','IM-Clinical','RESTART-STREAM'",
+    "dag_id": "MHS_PROV_CUST_LAKE_GROUP_SSS",
+    "schedule_time_in_minutes": "None",
+    "emr_name": "CUSTOMER_LAKE_EMR_IP"
+  },
+  "include-airflow-variables": [],
+  "tasks": [
+    {
+      "task-group-name": "RESTART_STREAM_JOBS",
+      "dependency-group-name": "",
+      "type": "TASK",
+      "task-object-type": "method",
+      "task-details": [
+        {
+          "task-template-name": "emr-execution",
+          "input-params-in-order": {
+            "params": "'/home/hadoop/stream-raw/restart_stream_jobs.sh', 'sss_lake', 'MHS_PROV_CUST_LAKE_GROUP'",
+            "id": "restart_stream_jobs",
+            "method": "restart_stream_jobs",
+            "pass_batch_number": "N",
+            "pass_control_file": "N"
+          }
+        }
+      ]
+    }
+  ]
+}
