@@ -1,35 +1,57 @@
-def _pick_oldest_ts_prefer_full_then_smallest_part(
-    self,
-    keys: List[str],
-    file_prefix: str,
-) -> str:
-    """Oldest timestamp date; prefer Full on that date; else oldest ts; always smallest part."""
-    candidates: List[Tuple[str, str, int, str]] = []
+import fnmatch
 
-    for k in keys:
-        fn = k.split("/")[-1]
-        if not fn.endswith(".tsv.gz"):
-            continue
+SEARCH_PREFIX = "${search_prefix}".rstrip("/") + "/"
+FILE_PATTERNS = ${file_patterns}
 
-        meta = self._parse_ts_type_part(fn, file_prefix)
-        if not meta:
-            continue
+def check_for_any_match(files, **kwargs):
+    for f in files:
+        key = f.get("Key", "") if isinstance(f, dict) else str(f)
+        file_name = key.split("/")[-1]
 
-        ts, ftype, part = meta
-        candidates.append((ts, ftype, part, k))
+        if any(fnmatch.fnmatch(file_name, pattern) for pattern in FILE_PATTERNS):
+            return True
 
-    if not candidates:
-        raise Exception(f"No matching .tsv.gz keys for prefix={file_prefix}")
+    return False
 
-    oldest_ts = min(ts for (ts, _, _, _) in candidates)
-    oldest_date = oldest_ts[:8]
+${method} = S3KeySensor(
+    task_id="${method}",
+    bucket_key=f"{SEARCH_PREFIX}*",
+    wildcard_match=True,
+    bucket_name=${bucket_name},
+    check_fn=check_for_any_match,
+    poke_interval=${poke_interval},
+    timeout=${timeout},
+    mode="reschedule",
+    soft_fail=True,
+    deferrable=False
+)
 
-    same_date = [c for c in candidates if c[0].startswith(oldest_date)]
-    fulls = [c for c in same_date if c[1] == "Full"]
-
-    if fulls:
-        _, _, _, selected = min(fulls, key=lambda x: (x[0], x[2]))
-        return selected
-
-    _, _, _, selected = min(candidates, key=lambda x: (x[0], x[2]))
-    return selected
+{
+  "task-group-name": "FILE_WATCHER_SOURCE",
+  "dependency-group-name": "",
+  "type": "TASK",
+  "task-object-type": "operator",
+  "task-details": [
+    {
+      "task-template-name": "s3_anykey_sensor",
+      "input-params-in-order": {
+        "method": "wait_for_source_files",
+        "search_prefix": "landing/source/current/",
+        "file_patterns": [
+          "ConfigurationFact*.tsv.gz",
+          "CrossWalkDimension*.tsv.gz",
+          "CompositeDimension*.tsv.gz",
+          "FeeTable*.tsv.gz",
+          "PricerDimension*.tsv.gz",
+          "PricerParameterDimension*.tsv.gz",
+          "ServiceDefinition*.tsv.gz",
+          "CodeCollectionDimension*.tsv.gz",
+          "CompositeServiceCategoryDimension*.tsv.gz"
+        ],
+        "bucket_name": "BUCKET_NAME",
+        "poke_interval": 300,
+        "timeout": 82800
+      }
+    }
+  ]
+}
