@@ -55,3 +55,27 @@ ${method} = S3KeySensor(
     }
   ]
 }
+
+
+def check_for_any_match(files, **kwargs):
+    print(f"SEARCH_PREFIX = {SEARCH_PREFIX}")
+    print(f"FILE_PATTERNS = {FILE_PATTERNS}")
+    print(f"Checking {len(files)} files found in prefix...")
+
+    for f in files:
+        key = f.get("Key", "") if isinstance(f, dict) else str(f)
+        file_name = key.split("/")[-1]
+
+        print(f"Full key  = {key}")
+        print(f"File name = {file_name}")
+
+        for pattern in FILE_PATTERNS:
+            matched = fnmatch.fnmatch(file_name, pattern)
+            print(f"Compare -> file='{file_name}' pattern='{pattern}' matched={matched}")
+
+            if matched:
+                print(f"Match found. Triggering on: {key}")
+                return True
+
+    print("No matching file found yet.")
+    return False
