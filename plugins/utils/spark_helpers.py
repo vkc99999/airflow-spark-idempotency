@@ -1,112 +1,123 @@
-import json
-import subprocess
-from typing import List, Tuple
+import hashlib
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
-def _run_cmd(args: List[str]) -> Tuple[int, str, str]:
-    """Run shell command with minimal logging noise."""
-    if "kubectl" in args:
-        p = subprocess.run(args, capture_output=True, text=True)
-        return p.returncode, p.stdout.strip(), p.stderr.strip()
-
-    p = subprocess.run(args, capture_output=True, text=True)
-    print(f"[DBG] CMD: {' '.join(args)} | RC={p.returncode}")
-    if p.stdout.strip():
-        out_lines = p.stdout.splitlines()[:5]
-        print(f"[DBG] OUT (first 5): {' | '.join(out_lines)}")
-    if p.stderr.strip():
-        err_lines = p.stderr.splitlines()[:3]
-        print(f"[DBG] ERR (first 3): {' | '.join(err_lines)}")
-    return p.returncode, p.stdout.strip(), p.stderr.strip()
+IDEMPOTENCY_LABEL = "airflow-idempotency-key"
+ACTIVE_PHASES = frozenset({"pending", "running"})
+SUCCESS_PHASES = frozenset({"succeeded"})
+FAILURE_PHASES = frozenset({"failed", "unknown"})
 
 
-def _first_or_blank(names: str) -> str:
-    parts = [n for n in names.split() if n]
-    return parts[0] if parts else ""
+@dataclass(frozen=True)
+class DriverPod:
+    name: str
+    phase: str
+    created_at: str = ""
 
 
-def _selector_driver_with_role(app_name: str, ns: str) -> str:
-    rc, out, _ = _run_cmd([
-        "kubectl", "get", "pods", "-n", ns,
-        "-l", f"spark-app-name={app_name},spark-role=driver",
-        "-o", "jsonpath={.items[*].metadata.name}",
-    ])
-    if rc == 0 and out:
-        return _first_or_blank(out)
-    return ""
+def build_idempotency_key(
+    context: Mapping[str, Any],
+    override: str | None = None,
+) -> str:
+    if override:
+        identity = override
+    else:
+        dag = context.get("dag")
+        task = context.get("task")
+        task_instance = context.get("ti")
+        dag_id = getattr(dag, "dag_id", "")
+        task_id = getattr(task, "task_id", "")
+        run_id = context.get("run_id") or getattr(task_instance, "run_id", "")
+        map_index = getattr(task_instance, "map_index", -1)
+        if not dag_id or not task_id or not run_id:
+            raise ValueError("Airflow context is missing dag_id, task_id, or run_id")
+        identity = f"{dag_id}|{task_id}|{run_id}|{map_index}"
+
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:40]
 
 
-def _selector_grep_driver_suffix(app_name: str, ns: str) -> str:
-    rc, out, _ = _run_cmd([
-        "kubectl", "get", "pods", "-n", ns,
-        "-l", f"spark-app-name={app_name}",
-        "-o", "jsonpath={.items[*].metadata.name}",
-    ])
-    if rc == 0 and out:
-        for n in out.split():
-            if n.endswith("-driver"):
-                return n
-    return ""
+def _core_v1_api():
+    from kubernetes.config.config_exception import ConfigException
 
+    from kubernetes import client, config
 
-def _find_driver_once(app_name: str, ns: str) -> str:
-    """Find one driver pod by role or suffix."""
-    return _selector_driver_with_role(app_name, ns) or _selector_grep_driver_suffix(app_name, ns)
-
-
-def _list_driver_pods(app_name: str, ns: str) -> List[str]:
-    """List non-completed driver pods for the given Spark app."""
-    rc, out, _ = _run_cmd([
-        "kubectl", "get", "pods", "-n", ns,
-        "-l", f"spark-app-name={app_name},spark-role=driver",
-        "-o", "json",
-    ])
-    if rc != 0 or not out:
-        return []
     try:
-        data = json.loads(out)
-        pods = []
-        for item in data.get("items", []):
-            name = item["metadata"]["name"]
-            phase = item["status"].get("phase", "Unknown")
-            if phase.lower() not in ("succeeded", "completed"):
-                pods.append(name)
-        pods.sort(
-            key=lambda x: next(
-                (
-                    i["metadata"]["creationTimestamp"]
-                    for i in data["items"]
-                    if i["metadata"]["name"] == x
-                ),
-                "",
-            ),
-            reverse=True,
+        config.load_incluster_config()
+    except ConfigException:
+        config.load_kube_config()
+    return client.CoreV1Api()
+
+
+def _timestamp(value: datetime | str | None) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value or "")
+
+
+def list_driver_pods(
+    idempotency_key: str,
+    namespace: str,
+    *,
+    api=None,
+) -> list[DriverPod]:
+    core_api = api or _core_v1_api()
+    response = core_api.list_namespaced_pod(
+        namespace=namespace,
+        label_selector=f"{IDEMPOTENCY_LABEL}={idempotency_key},spark-role=driver",
+        _request_timeout=30,
+    )
+    pods = [
+        DriverPod(
+            name=item.metadata.name,
+            phase=(item.status.phase or "Unknown").lower(),
+            created_at=_timestamp(item.metadata.creation_timestamp),
         )
-        return pods
-    except Exception as e:
-        print(f"[DBG] parse driver list failed: {e}")
-        return []
+        for item in response.items
+    ]
+    return sorted(pods, key=lambda pod: pod.created_at, reverse=True)
 
 
-def _pod_phase(pod: str, ns: str) -> str:
-    """Return pod phase from kubectl JSON output."""
-    rc, out, _ = _run_cmd(["kubectl", "get", "pod", pod, "-n", ns, "-o", "json"])
-    if rc == 0 and out:
-        try:
-            return json.loads(out)["status"]["phase"]
-        except Exception as e:
-            print(f"[DBG] parse pod JSON failed for {pod}: {e}")
-    return "Unknown"
+def classify_driver_pods(
+    pods: Sequence[DriverPod],
+) -> tuple[str, DriverPod | None]:
+    for phases, outcome in (
+        (ACTIVE_PHASES, "active"),
+        (SUCCESS_PHASES, "succeeded"),
+        (FAILURE_PHASES, "failed"),
+    ):
+        matching = next((pod for pod in pods if pod.phase in phases), None)
+        if matching:
+            return outcome, matching
+    return "missing", None
 
 
-def _sanitize_psql_scalar(raw: str) -> str:
-    """
-    Normalize psql scalar output by stripping quotes, pipes, and whitespace.
-    Example: '"spark-driver-pod" |' -> 'spark-driver-pod'
-    """
-    if not raw:
-        return ""
-    lines = [l for l in raw.splitlines() if l.strip()]
-    if not lines:
-        return ""
-    s = lines[-1]
-    return s.strip().strip("|").strip().strip('"').strip("'")
+def wait_for_terminal_phase(
+    pod_name: str,
+    namespace: str,
+    *,
+    timeout_seconds: int,
+    poll_interval_seconds: int = 10,
+    api=None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> str:
+    core_api = api or _core_v1_api()
+    deadline = monotonic() + timeout_seconds
+
+    while monotonic() < deadline:
+        pod = core_api.read_namespaced_pod(
+            name=pod_name,
+            namespace=namespace,
+            _request_timeout=30,
+        )
+        phase = (pod.status.phase or "Unknown").lower()
+        if phase not in ACTIVE_PHASES:
+            return phase
+        sleep(poll_interval_seconds)
+
+    raise TimeoutError(
+        f"Driver pod {pod_name!r} did not finish within {timeout_seconds} seconds"
+    )
